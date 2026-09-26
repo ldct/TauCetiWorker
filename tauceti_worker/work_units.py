@@ -2372,7 +2372,8 @@ def _do_progress_inner(w, opts) -> int | None:
     note_owner(w.cfg, "progress-roadmap", work="progress")  # attribution only; never stops the round
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
-    if not retained and not prepare_checkout(w.cfg, work="progress"):
+    # They read git history only; do not hydrate any build caches.
+    if not retained and not prepare_checkout(w.cfg, work="progress", source_only=True):
         from .work_recovery import LAST_REFUSAL
 
         raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")

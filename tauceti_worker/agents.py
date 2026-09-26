@@ -681,7 +681,12 @@ def repair_origin(co: Path) -> bool:
 
 
 def prepare_checkout(
-    cfg: Config, *, work: str | None = None, pr: int | None = None, roadmap: str | None = None
+    cfg: Config,
+    *,
+    work: str | None = None,
+    pr: int | None = None,
+    roadmap: str | None = None,
+    source_only: bool = False,
 ) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover.
 
@@ -689,10 +694,12 @@ def prepare_checkout(
     If the checkout cannot be reset safely (a process still uses it, or saving fails), the guard
     moves it aside whole and this clones a fresh one, so preparation never waits for a human.
     `work`/`pr`/`roadmap` name the round that takes the checkout, so a later record can say which
-    round left the source."""
+    round left the source. `source_only` refreshes git history without hydrating Mathlib or
+    touching Lake artifact caches."""
     from . import work_recovery
 
-    sync_mathlib_pool(cfg)
+    if not source_only:
+        sync_mathlib_pool(cfg)
     co = cfg.checkout
 
     def clone(why: str) -> bool:
@@ -765,7 +772,8 @@ def prepare_checkout(
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.
-    clean_lake_cache_after_toolchain_bump(cfg)
+    if not source_only:
+        clean_lake_cache_after_toolchain_bump(cfg)
     g("clean", "-fdxq", "-e", ".lake")
     # Attribution only: a failure is logged by note_owner and never stops the round.
     work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
