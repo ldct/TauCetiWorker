@@ -46,13 +46,13 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # merge gate in TauCetiRoadmap must run the SAME version, or the worker can emit headers the gate does
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
-PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "6d26dd3ebcee77d49c10355cce9daf632cc03325")
+# This fork adds only the gh fork CLI fix to the gate's 6d26dd3 release; report/header
+# generation is unchanged, so it remains compatible with the pinned roadmap gate.
+PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "ldct/TauCetiProgress")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "edd3e9dae0f91b0b7a5778d632f7ec017d818a55")
 # A full uv source URL permits a pinned, locally audited checkout during an emergency repair without
 # editing a disposable uvx environment. Production normally leaves this unset and uses GitHub.
-PROGRESS_SOURCE = os.environ.get(
-    "TAUCETI_PROGRESS_SOURCE", f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}"
-)
+PROGRESS_SOURCE = os.environ.get("TAUCETI_PROGRESS_SOURCE", f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}")
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
