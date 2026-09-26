@@ -348,7 +348,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
             nap = GH_TRANSIENT_BASE << tries
             if waited + nap > max_wait:
                 return p
-            log(f"gh: {one_line(text, 120)} — transient, retrying in {nap}s ({' '.join(argv[1:3])})")
+            log(f"gh: {one_line(_gh_diagnostic(text), 120)} — transient, retrying in {nap}s ({' '.join(argv[1:3])})")
             time.sleep(nap)
             waited += nap
             tries += 1
@@ -377,6 +377,18 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
 # ============================================================================
 
 
+def _gh_diagnostic(text: str) -> str:
+    """Bound CLI diagnostics and strip credentials before displaying remote error text."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+        if token := os.environ.get(name):
+            text = text.replace(token, "<redacted>")
+    text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b", "<redacted>", text)
+    text = re.sub(r"(?im)(authorization\s*:\s*)(?:bearer|token|basic)\s+\S+", r"\1<redacted>", text)
+    text = re.sub(r"https?://[^\s/@]+:[^\s/@]+@", "https://<redacted>@", text)
+    text = " ".join(text.split())
+    return text if len(text) <= 2000 else text[:2000] + " … [truncated]"
+
+
 # The survey's open-PR page. Only the fields PRInfo reads, and for the head's status ONLY the commit
 # status contexts — never a check run. That distinction is load-bearing and predates this query: a
 # check-run reflects a job's outcome and can go red on an infra hiccup while the authoritative `build`
@@ -391,11 +403,17 @@ _OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
         headRepositoryOwner{login} headRepository{name}
         author{login __typename}
         labels(first:50){totalCount nodes{name}}
-        commits(last:1){nodes{commit{status{contexts{context state createdAt}}}}}
+        commits(last:1){nodes{commit{oid status{contexts{context state createdAt}}}}}
       }
     }
   }
 }"""
+
+_PR_PROGRESS_QUERY = (
+    "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
+    "pullRequest(number:$pr){headRefOid comments{totalCount}"
+    "reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
+)
 
 
 def _pr_json_from_graphql(node: dict) -> dict:
@@ -434,6 +452,77 @@ class GitHub:
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         return gh_run(["gh", *args])
 
+    def ignore_pr_notifications(self, pr: int) -> bool:
+        """Best-effort mute this authenticated user's notification thread for PR *pr*.
+
+        GitHub notification subscriptions are per authenticated user and per notification-thread, not
+        per email address or PR number. Locate the PR's thread in this repository's complete
+        notification list, then set ``ignored=true`` on that thread. This deliberately does not retry
+        the PUT: it is a post-review convenience, never a reason to replay an already-posted review.
+        """
+        try:
+            listed = self._gh(["api", "--paginate", f"/repos/{self.repo}/notifications?all=true&per_page=50"])
+        except Exception:
+            log(f"  review #{pr}: disabling PR notifications FAILED unexpectedly; review remains successful")
+            return False
+        if listed.returncode != 0:
+            detail = _gh_diagnostic((listed.stderr or "") + "\n" + (listed.stdout or ""))
+            log(f"  review #{pr}: disabling PR notifications FAILED while finding its thread ({detail or 'no detail'})")
+            return False
+        try:
+            threads = json.loads(listed.stdout or "[]")
+        except json.JSONDecodeError:
+            log(f"  review #{pr}: disabling PR notifications FAILED (GitHub returned invalid notification JSON)")
+            return False
+        if not isinstance(threads, list):
+            log(f"  review #{pr}: disabling PR notifications FAILED (GitHub returned an invalid notification list)")
+            return False
+
+        # subject.url is host-specific on GitHub Enterprise, so match the stable REST path rather
+        # than assuming api.github.com. The repository-scoped listing above supplies the other half
+        # of the identity check.
+        suffix = f"/repos/{self.repo}/pulls/{pr}"
+        thread_ids = [
+            str(thread["id"])
+            for thread in threads
+            if isinstance(thread, dict)
+            and isinstance(thread.get("id"), (str, int))
+            and isinstance(thread.get("subject"), dict)
+            and thread["subject"].get("type") == "PullRequest"
+            and isinstance(thread["subject"].get("url"), str)
+            and thread["subject"]["url"].rstrip("/").endswith(suffix)
+        ]
+        if not thread_ids:
+            log(
+                f"  review #{pr}: no GitHub notification thread found to disable for the authenticated account; "
+                "review remains successful"
+            )
+            return False
+
+        ok = True
+        for thread_id in thread_ids:
+            try:
+                muted = self._gh(
+                    ["api", "-X", "PUT", f"/notifications/threads/{thread_id}/subscription", "-F", "ignored=true"]
+                )
+            except Exception:
+                log(
+                    f"  review #{pr}: disabling notification thread {thread_id} FAILED unexpectedly; "
+                    "review remains successful"
+                )
+                ok = False
+                continue
+            if muted.returncode != 0:
+                detail = _gh_diagnostic((muted.stderr or "") + "\n" + (muted.stdout or ""))
+                log(
+                    f"  review #{pr}: disabling notification thread {thread_id} FAILED "
+                    f"({detail or 'no detail'}); review remains successful"
+                )
+                ok = False
+                continue
+            log(f"  review #{pr}: disabled notifications for the authenticated account (thread {thread_id})")
+        return ok
+
     def open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
         """Every open PR, paged, in the same shape `gh pr list --json` returns (so PRInfo.from_json
         reads either).
@@ -453,37 +542,54 @@ class GitHub:
         owner, _, name = self.repo.partition("/")
         out: list[dict] = []
         seen: set[int] = set()
-        truncated: list[int] = []
+        seen_cursors: set[str] = set()
         cursor = None
         for _ in range(OPEN_PR_MAX_PAGES):
             args = ["api", "graphql", "-F", f"owner={owner}", "-F", f"repo={name}", "-F", f"n={page}"]
             if cursor:
                 args += ["-F", f"cursor={cursor}"]
             p = self._gh([*args, "-f", f"query={_OPEN_PRS_QUERY}"])
+            context = f"repo={self.repo}, state=open, page={_ + 1}, exit={p.returncode}"
             if p.returncode != 0:
-                raise GitHubError(f"open PR query failed: {one_line(p.stderr or p.stdout, 160)}")
+                detail = _gh_diagnostic(p.stderr or p.stdout or "no stderr or stdout")
+                raise GitHubError(f"open PR query failed ({context}): {detail}")
             try:
-                conn = json.loads(p.stdout)["data"]["repository"]["pullRequests"]
-            except (ValueError, TypeError, KeyError) as e:
-                raise GitHubError(f"open PR query returned no pull requests ({e})") from e
-            for node in conn.get("nodes") or []:
-                # Same principle as the page cap, one level down: a PR carrying more labels than we
-                # asked for would come back quietly short, and the status pipeline reads labels.
-                labels = node.get("labels") or {}
-                if labels.get("totalCount", 0) > len(labels.get("nodes") or []):
-                    truncated.append(node.get("number"))
-                # Ordered by creation, which never changes, so a PR updated mid-scan cannot reorder
-                # itself across a page boundary. Dedupe anyway: a skipped PR is invisible work, and
-                # this is the one place that would hide it.
-                if node and node.get("number") not in seen:
-                    seen.add(node["number"])
-                    out.append(_pr_json_from_graphql(node))
-            info = conn.get("pageInfo") or {}
-            if not info.get("hasNextPage"):
-                if truncated:
-                    log(f"open PR query: {len(truncated)} PR(s) carry more than 50 labels, e.g. #{truncated[0]}")
-                return out
-            cursor = info.get("endCursor")
+                payload = json.loads(p.stdout)
+                # GraphQL may return partial data WITH errors, even after a successful HTTP read.
+                # Never let that masquerade as the whole project (and fall through to authoring).
+                if payload.get("errors"):
+                    raise ValueError(json.dumps(payload["errors"]))
+                conn = payload["data"]["repository"]["pullRequests"]
+                nodes, info = conn["nodes"], conn["pageInfo"]
+                if not isinstance(nodes, list) or not isinstance(info, dict):
+                    raise ValueError("missing nodes or pageInfo")
+                if not isinstance(info.get("hasNextPage"), bool):
+                    raise ValueError("missing hasNextPage")
+                for node in nodes:
+                    if not isinstance(node, dict) or not isinstance(node.get("number"), int):
+                        raise ValueError("invalid PR node")
+                    # Labels gate work: prefer a visible refusal to silently missing a status label.
+                    labels = node["labels"]
+                    if labels["totalCount"] != len(labels["nodes"]):
+                        raise ValueError(f"PR #{node['number']} has incomplete labels")
+                    commits = node["commits"]["nodes"]
+                    if commits and commits[0]["commit"]["oid"] != node["headRefOid"]:
+                        raise ValueError(f"PR #{node['number']} head changed during query; retry survey")
+                    # Creation order never changes; dedupe anyway for a consistent single check/PR.
+                    if node["number"] not in seen:
+                        seen.add(node["number"])
+                        out.append(_pr_json_from_graphql(node))
+                if not info["hasNextPage"]:
+                    return out
+                cursor = info.get("endCursor")
+                if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                    raise ValueError("invalid or repeated pagination cursor")
+                seen_cursors.add(cursor)
+            except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
+                detail = _gh_diagnostic(str(e))
+                raise GitHubError(
+                    f"open PR query returned no pull requests ({context}): invalid/incomplete GraphQL response: {detail}"
+                ) from e
         # Refusing here is the point: the alternative is returning a truncated list that reads as the
         # whole project, which is exactly the failure `--limit` used to hide.
         raise GitHubError(f"open PR query exceeded {OPEN_PR_MAX_PAGES} pages of {page} ({len(out)} PRs so far)")
@@ -494,7 +600,15 @@ class GitHub:
             args += ["--author", author]
         p = self._gh(args)
         if p.returncode != 0:
-            raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
+            context = f"repo={self.repo}, state={state}" + (f", author={author}" if author else "")
+            detail = _gh_diagnostic(p.stderr or "")
+            if detail:
+                detail = "stderr: " + detail
+            else:
+                detail = (
+                    "stdout: " + _gh_diagnostic(p.stdout) if p.stdout and p.stdout.strip() else "no stderr or stdout"
+                )
+            raise GitHubError(f"gh pr list failed ({context}, exit={p.returncode}): {detail}")
         return json.loads(p.stdout or "[]")
 
     def issue_list(
@@ -645,11 +759,7 @@ class GitHub:
         fetched first:100; on the rare PR with more, we fall back to the exact paginated REST count so the
         guard never undercounts a comment that landed on a later thread."""
         owner, _, name = self.repo.partition("/")
-        q = (
-            "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
-            "pullRequest(number:$pr){headRefOid comments{totalCount}"
-            "reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
-        )
+        q = _PR_PROGRESS_QUERY
         p = self._gh(
             ["api", "graphql", "-f", f"query={q}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"pr={pr}"]
         )

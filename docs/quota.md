@@ -82,6 +82,16 @@ session reset timestamp invalid
 rather than a generic "usage unknown". An unreadable constraint is not the same
 as no constraint.
 
+## Quota reserve
+
+By default TauCeti keeps 10% of every reported Codex and Claude window unused. A
+window with exactly 10% left may still launch; once it falls below 10%, the
+provider is hard-blocked until that window resets. This guard is independent of
+the soft pacing curve and is not bypassed by `--ignore-quota`.
+
+Set `--quota-reserve PERCENT`, `$TAUCETI_QUOTA_RESERVE`, or the persistent
+worker field `quota_reserve`. Use `0` to disable the reserve.
+
 ## The window bootstrap
 
 There is one gap where the endpoint reports a window with no usage and no reset

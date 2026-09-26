@@ -272,11 +272,36 @@ def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -
     )
 
 
+def _confirmed_codex_model_access(cfg: Config, model: str) -> bool:
+    """Return whether `model` is usable after a stable subscription-access result.
+
+    Two matching structured rejections are required before treating a model as unavailable. A transient
+    or malformed result is never mistaken for entitlement loss, and therefore never changes selection.
+    """
+    first = _codex_model_probe(cfg, model)
+    if first.returncode == 0:
+        return True
+    if not _codex_model_unavailable(first.returncode, first.stdout or ""):
+        raise _codex_probe_failure(model, first)
+
+    # Reconfirm entitlement before either choosing a fallback or rejecting the last candidate. Both
+    # probes are trivial, read-only, and checkout-independent; the real authoring prompt is still run
+    # exactly once after selection.
+    second = _codex_model_probe(cfg, model)
+    if second.returncode == 0:
+        return True
+    if _codex_model_unavailable(second.returncode, second.stdout or ""):
+        return False
+    raise _codex_probe_failure(model, second)
+
+
 def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> AuthoringProfile:
-    """Resolve a default Sol profile to Sol or Luna before the real task runs.
+    """Resolve a default Sol profile to Sol or a verified Luna fallback before authoring.
 
     Explicit model pins have no fallback and bypass this probe. A confirmed result is cached per worker
-    and account; failures that might be transient are never cached and never cause a downgrade.
+    and account; failures that might be transient are never cached and never cause a downgrade. A cached
+    primary miss is usable only when the fallback was verified too, so a legacy cache entry cannot launch
+    a model the current Codex account does not support.
     """
     fallback = profile.fallback_model
     if profile.provider != "codex" or not fallback:
@@ -291,31 +316,30 @@ def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> Author
         and not isinstance(fetched_at, bool)
         and time.time() - fetched_at <= CODEX_MODEL_ACCESS_TTL
     )
+    cached_primary_available = cached.get("available")
+    cached_fallback_available = cached.get("fallback_available")
+    cache_complete = isinstance(cached_primary_available, bool) and (
+        cached_primary_available or cached_fallback_available is True
+    )
     if (
         fp is not None
         and cached.get("fp") == fp
         and cached.get("primary_model") == profile.model
         and cached.get("fallback_model") == fallback
         and age_ok
-        and isinstance(cached.get("available"), bool)
+        and cache_complete
     ):
-        available = cached["available"]
+        primary_available = cached_primary_available
     else:
-        first = _codex_model_probe(cfg, profile.model)
-        if first.returncode == 0:
-            available = True
-        elif _codex_model_unavailable(first.returncode, first.stdout or ""):
-            # Reconfirm entitlement before persisting a downgrade. Both probes are trivial, read-only,
-            # and checkout-independent; the real authoring prompt is still executed exactly once.
-            second = _codex_model_probe(cfg, profile.model)
-            if second.returncode == 0:
-                available = True
-            elif _codex_model_unavailable(second.returncode, second.stdout or ""):
-                available = False
-            else:
-                raise _codex_probe_failure(profile.model, second)
-        else:
-            raise _codex_probe_failure(profile.model, first)
+        primary_available = _confirmed_codex_model_access(cfg, profile.model)
+        fallback_available = None
+        if not primary_available:
+            fallback_available = _confirmed_codex_model_access(cfg, fallback)
+            if not fallback_available:
+                raise NoProgress(
+                    f"codex model-access probes confirmed neither default {profile.model} nor fallback {fallback} "
+                    "is available to this subscription; not launching authoring"
+                )
 
         if fp is not None:
             cfg.quota_cache.mkdir(parents=True, exist_ok=True)
@@ -326,13 +350,14 @@ def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> Author
                     "fp": fp,
                     "primary_model": profile.model,
                     "fallback_model": fallback,
-                    "available": available,
+                    "available": primary_available,
+                    "fallback_available": fallback_available,
                 },
             )
 
-    if available:
+    if primary_available:
         return replace(profile, fallback_model=None)
-    log(f"codex: {profile.model} is unavailable to this subscription; using {fallback}")
+    log(f"codex: {profile.model} is unavailable to this subscription; using verified fallback {fallback}")
     return replace(profile, model=fallback, model_source="subscription fallback", fallback_model=None)
 
 

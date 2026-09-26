@@ -57,7 +57,8 @@ class FakeRS:
 
 
 class FakeGH:
-    pass
+    def ignore_pr_notifications(self, pr):
+        return True
 
 
 _tmp = tempfile.TemporaryDirectory()

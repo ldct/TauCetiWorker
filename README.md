@@ -1,5 +1,8 @@
 # Tau Ceti Worker
 
+This fork's maintained integration branch is **`ldct/enhancements`**. See the
+[consolidated changes and installation instructions](docs/ldct-enhancements.md).
+
 `tauceti` keeps the [TauCeti](https://github.com/TauCetiProject/TauCeti) Lean
 library moving, using a "bring your own agent" approach. Run it with no command
 and you get a dashboard of the work the queue needs right now: PRs to review,
@@ -16,6 +19,10 @@ forks `TauCetiProject/TauCeti` once, automatically, pushes authored branches and
 fixes there, and opens PRs from it, so you do **not** need write access to the
 canonical repo. (A fine-grained token scoped only to the canonical repo is not
 enough.) Set `TAUCETI_FORK=<owner>/<repo>` to use an existing fork instead.
+
+For a separate API budget on public reads, optionally connect a read-only GitHub
+App installed on your fork. Contributions still use your personal account; see
+[GitHub App read authentication](docs/github-app-reads.md).
 
 Run as many workers as you like: they take a lease on each job so two of them
 never write the same report or fix the same PR, and that needs no setup and no
@@ -207,8 +214,8 @@ rather than wandering onto other work.
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` (default) | Codex (`gpt-6-sol` → Luna if unavailable, high) preferred; Claude (`claude-opus-5-5`, high) fallback | subscription, paced |
-| `codex` | `gpt-6-sol`, high effort; Luna fallback if Sol is unavailable | subscription, paced |
+| `auto` (default) | Codex (`gpt-6-sol` → verified `gpt-6-luna` if unavailable, high) preferred; Claude (`claude-opus-5-5`, high) fallback | subscription, paced |
+| `codex` | `gpt-6-sol`, high effort; verified `gpt-6-luna` fallback if Sol is unavailable | subscription, paced |
 | `claude` | `claude-opus-5-5`, high effort | subscription, paced |
 | `kiro` | `gpt-5.6-sol`, high effort by default; exact `claude-opus-5` opt-in | subscription credits, unpaced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
@@ -359,10 +366,11 @@ current usage and why a provider is waiting.
 | _(default)_ | The curve `60:40`: 40% of the quota by 60% of the window, then a ramp to the full quota by the reset. Holds a reserve for work that arrives late in a window |
 | `--pace 0:10,50:70,90:90` | Use a different piecewise-linear `time%:budget%` curve: 10% allowed immediately, ramping to 70% by halfway and 90% at 90% of the window, interpolated between points. Usage must remain strictly below the current budget. Budgets ≥ 100 mean no soft cap; a window at 100% used still backs off |
 | `--pace 0:0,100:100` | Spend at clock rate: the plain `used% < elapsed%` rule, which was the default before |
-| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex` or `--agent claude`; hard limits still apply |
+| `--quota-reserve 10` | Keep at least 10% of every subscription quota window unused. This hard launch guard defaults to 10%; set it to `0` to disable it. `--ignore-quota` does not bypass the reserve |
+| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex` or `--agent claude`; the quota reserve and provider hard limits still apply |
 | `--quota-cmd CMD` | Your own pacer, run as `<cmd> <agent>`: the first stdout token is the model to run; empty output means wait |
 
-`TAUCETI_PACE` and `TAUCETI_QUOTA_CMD` set the corresponding controls by
+`TAUCETI_PACE`, `TAUCETI_QUOTA_RESERVE`, and `TAUCETI_QUOTA_CMD` set the corresponding controls by
 default. After a Claude window resets, `tauceti` may make one small request to
 start its usage clock, but only after it has found work and confirmed the other
 window has room.

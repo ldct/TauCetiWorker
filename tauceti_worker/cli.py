@@ -67,9 +67,19 @@ from .constants import (
     WORK_TASKS,
 )
 from .github import GitHub, shared_claims_granted
+from .github_app import AppError
+from .github_app import enable as enable_github_app
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
-from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
+from .quota import (
+    Quota,
+    _claude_keychain_creds,
+    _safe_exists,
+    claude_dir,
+    codex_dir,
+    parse_pace_curve,
+    parse_quota_reserve,
+)
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
 from .runtime_status import report_failure
@@ -125,6 +135,7 @@ environment (flags win; full reference linked below):
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
+  TAUCETI_QUOTA_RESERVE  minimum quota left before launches stop (default = 10)
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
@@ -299,7 +310,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         dest="ignore_quota",
         action="store_true",
         help="ignore the quota PACER (run the requested --agent even when ahead of the burn pace); "
-        "a HARD block — a window at 100%%, unreadable usage, or the usage endpoint refusing to answer — "
+        "the quota reserve, a provider hard limit, unreadable usage, or the endpoint refusing to answer "
         "still backs off (needs an explicit paced --agent codex|claude — 'auto' can't choose without the pacer)",
     )
     # Internal: the loop sets this on a round it selected while a Claude window was reset-but-unopened.
@@ -336,6 +347,15 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "`60:40` — 40%% of the quota through the first 60%% of a window, then a ramp to the full quota "
         "by the reset; `0:0,100:100` restores the plain used%% < elapsed%% rule. Overrides "
         "$TAUCETI_PACE for this run (inherited by loop children)",
+    )
+    p.add_argument(
+        "--quota-reserve",
+        dest="quota_reserve",
+        default=None,
+        metavar="PERCENT",
+        help="stop launching subscription agents when any quota window has less than this percentage "
+        "remaining (default: 10; 0 disables the reserve). This is a hard guard and --ignore-quota does "
+        "not bypass it. Overrides $TAUCETI_QUOTA_RESERVE for this run (inherited by loop children)",
     )
     p.add_argument(
         "--worker-id",
@@ -605,12 +625,32 @@ def resolve_pace(cmd: str | None, args) -> None:
         os.environ["TAUCETI_PACE"] = override
 
 
+def resolve_quota_reserve(cmd: str | None, args) -> None:
+    """Validate and install the hard remaining-quota launch floor for work processes."""
+    override = getattr(args, "quota_reserve", None) if cmd in ("work", "_round") else None
+    raw, source = (
+        (override, "--quota-reserve")
+        if override is not None
+        else (os.environ.get("TAUCETI_QUOTA_RESERVE"), "$TAUCETI_QUOTA_RESERVE")
+    )
+    parsed = None
+    if raw is not None and (override is not None or str(raw).strip()):
+        try:
+            parsed = parse_quota_reserve(raw)
+        except ValueError as e:
+            raise Die(f"{source}: {e}") from None
+    if override is not None:
+        assert parsed is not None
+        os.environ["TAUCETI_QUOTA_RESERVE"] = str(parsed)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     cmd = args.cmd
 
     resolve_pace(cmd, args)
+    resolve_quota_reserve(cmd, args)
 
     if cmd is None:
         return cmd_tui(args)
@@ -737,7 +777,19 @@ def cmd_status(args) -> int:
     gh = GitHub()
     rs = ReviewState(cfg, gh)
     counters = Counters(cfg)
-    sv = survey(cfg, gh, rs, counters, deep=True)
+    # Progress belongs on stderr: redirected stdout (especially --json) remains machine-readable.
+    last_progress = 0.0
+
+    def report(message: str) -> None:
+        nonlocal last_progress
+        now = time.monotonic()
+        if message.startswith("Checking PR reviews:") and now - last_progress < 1:
+            return
+        print(f"tauceti: {message}", file=sys.stderr, flush=True)
+        last_progress = now
+
+    sv = survey(cfg, gh, rs, counters, deep=True, progress=report)
+    report("Checking quota…")
     _, quota_snap = Quota(cfg).choose(None)
 
     if getattr(args, "json", False):
@@ -786,7 +838,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # --auto-refresh likewise, so a loop child renews on the same authority the driver was given.
     if getattr(args, "auto_refresh", None):
         os.environ["TAUCETI_AUTO_REFRESH"] = "1"
-    # --pace is settled in resolve_pace, before dispatch, together with the environment it overrides.
+    # --pace and --quota-reserve are settled before dispatch, together with the environment values
+    # they override, so loop children inherit the exact launch policy.
     # --stream restores live agent output (default redirects it to a log file). Set in the env so loop
     # children inherit it.
     if getattr(args, "stream", False):
@@ -1121,7 +1174,11 @@ def cli_main() -> int:
         log("no system CA bundle found; set SSL_CERT_FILE if TLS verification fails")
     _ensure_scripts_executable()
     try:
+        enable_github_app()
         return main() or 0
+    except AppError as e:
+        log(f"GitHub App: {e}")
+        return 1
     except Die as e:
         log(str(e))
         report_failure(str(e), code=1)

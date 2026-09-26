@@ -11,6 +11,7 @@ enabled = true
 agent = "codex"
 only = ["rebase", "review"]
 ignore_quota = true
+quota_reserve = 5
 
 [[workers]]
 id = "worker3"

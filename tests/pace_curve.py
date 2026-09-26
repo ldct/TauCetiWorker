@@ -191,6 +191,8 @@ check("...and a valid one is kept", tc.WorkerSpec.from_dict({"id": "w1", "pace":
 
 # --- _classify_window honours the live curve --------------------------------------------------------
 def status(used, elapsed, pace):
+    # This suite isolates the soft curve; quota_reserve.py covers the independent hard reserve.
+    os.environ["TAUCETI_QUOTA_RESERVE"] = "0"
     if pace is None:
         os.environ.pop("TAUCETI_PACE", None)
     else:

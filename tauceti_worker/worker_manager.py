@@ -31,7 +31,7 @@ from typing import NoReturn
 
 from .constants import AGENTS, ALLOWED_TASKS
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
-from .quota import parse_pace_curve
+from .quota import parse_pace_curve, parse_quota_reserve
 from .round import signal_group
 from .runtime_status import STATUS_ENV, read_json, update_status
 
@@ -54,6 +54,7 @@ _WORKER_KEYS = {
     "author_model",
     "author_effort",
     "pace",
+    "quota_reserve",
     "stream",
     "isolate_home",
     "restart",
@@ -191,6 +192,17 @@ def _pace(value, where: str) -> str | None:
     return spec
 
 
+def _quota_reserve(value, where: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise WorkersError(f"{where} must be a number from 0 to 100")
+    try:
+        return parse_quota_reserve(value)
+    except ValueError as e:
+        raise WorkersError(f"{where}: {e}") from None
+
+
 # Names the manager or the worker's own bootstrap owns. Setting one from the config would break the
 # thing it configures, and the failure would read as a worker bug rather than a configuration error:
 # the first four decide which state file the worker heartbeats into, whether it knows it is managed,
@@ -255,6 +267,7 @@ class WorkerSpec:
     author_model: str | None = None
     author_effort: str | None = None
     pace: str | None = None
+    quota_reserve: float | None = None
     stream: bool = False
     isolate_home: bool = False
     restart: str = "always"
@@ -305,6 +318,7 @@ class WorkerSpec:
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
             pace=_pace(raw.get("pace"), f"workers[{index}].pace"),
+            quota_reserve=_quota_reserve(raw.get("quota_reserve"), f"workers[{index}].quota_reserve"),
             stream=_boolean(raw.get("stream", False), f"workers[{index}].stream"),
             isolate_home=_boolean(raw.get("isolate_home", False), f"workers[{index}].isolate_home"),
             restart=restart,
@@ -336,7 +350,7 @@ class WorkerSpec:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if not self.respect_claims:
             value["respect_claims"] = False
-        for name in ("source", "author_model", "author_effort", "pace"):
+        for name in ("source", "author_model", "author_effort", "pace", "quota_reserve"):
             item = getattr(self, name)
             if item is not None:
                 value[name] = item
@@ -381,6 +395,7 @@ class WorkerSpec:
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
             (self.pace, "--pace"),
+            (None if self.quota_reserve is None else str(self.quota_reserve), "--quota-reserve"),
         ):
             if field is not None:
                 argv += [flag, field]
@@ -424,6 +439,11 @@ def _toml_value(value) -> str:
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        # An inline table, which is what `env` is. Keys are already constrained to POSIX-portable
+        # names, so they need no quoting; values go through the string branch. Written in sorted
+        # order so a rewrite of an unchanged definition is byte-identical.
+        return "{ " + ", ".join(f"{k} = {_toml_value(v)}" for k, v in sorted(value.items())) + " }"
     raise WorkersError(f"cannot encode TOML value of type {type(value).__name__}")
 
 
@@ -1165,9 +1185,11 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
     sandbox = str(spec.get("sandbox") or item.get("sandbox") or "host")
     lines.extend(_status_field("agent", [f"{agent} · {sandbox} sandbox"], width))
 
-    pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
+    pacing = "ignored (--ignore-quota; hard guards still apply)" if spec.get("ignore_quota") else "normal"
     if spec.get("pace"):
         pacing += f" · curve {spec['pace']}"
+    if spec.get("quota_reserve") is not None:
+        pacing += f" · reserve {spec['quota_reserve']:g}%"
     lines.extend(_status_field("pacing", [pacing], width))
 
     # Worth stating rather than leaving implicit: this worker rotates the operator's Claude credential.
@@ -1636,6 +1658,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                 "--author-model": "author_model",
                 "--author-effort": "author_effort",
                 "--pace": "pace",
+                "--quota-reserve": "quota_reserve",
             }.get(token)
             if key is None:
                 raise WorkersError(f"{path}:{number}: unsupported legacy argument {token}")
@@ -1703,6 +1726,11 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
     add.add_argument("--pace", help="soft pacing curve as time%%:budget%% points, e.g. 0:10,50:70,90:90")
+    add.add_argument(
+        "--quota-reserve",
+        type=float,
+        help="minimum percentage to keep unused in every subscription quota window (default: 10)",
+    )
     add.add_argument("--stream", action="store_true", help="keep the agent transcript in the console log")
     add.add_argument(
         "--isolate-home",
@@ -1786,7 +1814,7 @@ def cmd_workers(args) -> int:
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,
                 }
-                for key in ("roadmap_only", "source", "author_model", "author_effort", "pace"):
+                for key in ("roadmap_only", "source", "author_model", "author_effort", "pace", "quota_reserve"):
                     value = getattr(args, key)
                     if value is not None:
                         raw[key] = value

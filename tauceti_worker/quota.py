@@ -39,6 +39,37 @@ WEEK_WINDOW_S = 7 * 24 * 3600
 
 QUOTA_TTL = {"codex": 600, "claude": 3600}
 
+DEFAULT_QUOTA_RESERVE = 10.0
+
+
+def parse_quota_reserve(value: object) -> float:
+    """A percentage of each subscription window to keep unspent.
+
+    The launch guard is strict: a window blocks only once its remaining quota is below this value, so
+    the default 10 permits a launch at exactly 10% remaining and stops at 9.9%."""
+    if isinstance(value, bool):
+        raise ValueError("quota reserve must be a number from 0 to 100")
+    try:
+        reserve = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError("quota reserve must be a number from 0 to 100") from e
+    if not math.isfinite(reserve) or not 0 <= reserve <= 100:
+        raise ValueError("quota reserve must be a finite number from 0 to 100")
+    return reserve
+
+
+def quota_reserve() -> float:
+    """The live minimum remaining quota percentage, inherited by loop children."""
+    raw = os.environ.get("TAUCETI_QUOTA_RESERVE")
+    if raw is None or not raw.strip():
+        return DEFAULT_QUOTA_RESERVE
+    try:
+        return parse_quota_reserve(raw)
+    except ValueError:
+        # Sanctioned entry points validate this up front. Fail safe if an embedding bypasses them.
+        return DEFAULT_QUOTA_RESERVE
+
+
 # Tolerance on a Claude reset clock that reads as already elapsed. Inside it we still treat the window
 # as live (it is about to roll); beyond it the endpoint is describing a window that has already ended,
 # so its usage figure no longer paces the current one (see _claude_record_state).
@@ -310,12 +341,21 @@ STATUS_OVER_PACE = "over-pace"
 
 STATUS_EXHAUSTED = "exhausted"
 
+STATUS_BELOW_RESERVE = "below-reserve"
+
 # Soft = real quota remains and only the burn-pace throttle is holding us; this is what --ignore-quota
 # may override. Hard = fail-closed: exhausted, or a window we cannot read / cannot legitimately spend
 # against. `unknown` is the generic fail-closed status the codex reader still emits.
 SOFT_STATUSES = (STATUS_AT_BUDGET, STATUS_OVER_PACE)
 
-HARD_STATUSES = (STATUS_EXHAUSTED, STATE_IDLE, STATE_ABSENT, STATE_MALFORMED, "unknown")
+HARD_STATUSES = (
+    STATUS_EXHAUSTED,
+    STATUS_BELOW_RESERVE,
+    STATE_IDLE,
+    STATE_ABSENT,
+    STATE_MALFORMED,
+    "unknown",
+)
 
 # How a single JSON field read: omitted, explicitly null, a usable value, or garbage. Collapsing these
 # is what let an invalid reset timestamp read the same as an explicit null (⇒ "fresh window").
@@ -348,7 +388,7 @@ class Window:
     used: float | None  # percent 0..100 (None = unknown)
     elapsed: float | None  # percent 0..100 (None = unknown)
     resets_at: float | None  # epoch seconds
-    status: str  # under-pace | over-pace | exhausted | idle | absent | malformed | unknown
+    status: str  # under-pace | over-pace | below-reserve | exhausted | idle | absent | malformed | unknown
     budget: float | None = None  # pace budget (max allowed used%) at this window's elapsed%, if computed
     detail: str | None = None  # why a non-pacing status happened, phrased to follow the window name
 
@@ -396,8 +436,12 @@ def _classify_window(
     # Strictly under the budget = headroom for another request. Exactly AT it is not: the next request
     # costs something, so starting one would put us over. (Equality is not an edge case — the default
     # curve's budget is 0 at elapsed 0, so a fresh window sits exactly on its budget.)
+    reserve = quota_reserve()
+    remaining = 100.0 - u
     if u >= 100:
         st = STATUS_EXHAUSTED
+    elif remaining < reserve:
+        st = STATUS_BELOW_RESERVE
     elif u < thr:
         st = STATUS_UNDER_PACE
     elif u == thr:
@@ -2130,7 +2174,7 @@ class Quota:
             if w.status in (STATUS_AT_BUDGET, STATUS_OVER_PACE):
                 paced = _pace_free_at(w, now)
                 soon.append(w.resets_at if paced is None else paced)
-            elif w.status == STATUS_EXHAUSTED:
+            elif w.status in (STATUS_EXHAUSTED, STATUS_BELOW_RESERVE):
                 soon.append(w.resets_at)
         blocked = [t for t in soon if t]
         return min(blocked) if blocked else None
@@ -2204,8 +2248,11 @@ def _window_reason(w: Window) -> str:
     reader recorded ("weekly limit missing from usage response", "session reset timestamp invalid",
     "session window reset; awaiting initialization") over the generic fallback — an operator cannot act
     on "usage unknown", and the failures it used to cover need completely different responses."""
-    if w.status == "exhausted":
+    if w.status == STATUS_EXHAUSTED:
         return f"{w.name} exhausted"
+    if w.status == STATUS_BELOW_RESERVE:
+        left = max(0.0, 100.0 - (w.used or 0.0))
+        return f"{w.name} below quota reserve ({left:g}% left < {quota_reserve():g}%)"
     return f"{w.name} {w.detail}" if w.detail else f"{w.name} usage unknown"
 
 
@@ -2213,8 +2260,8 @@ def _unavail_reason(prov: Provider) -> tuple[bool, str]:
     """Why an unavailable provider can't be used, and whether the block is *soft*.
 
     A soft block means there is real quota left and we're only pausing to pace the burn (over-pace) —
-    distinct from a hard block where a window is exhausted, reset-but-uninitialized, missing or
-    unreadable (all fail-closed). Returns (soft, reason)."""
+    distinct from a hard block where a window is below the configured reserve, exhausted,
+    reset-but-uninitialized, missing or unreadable (all fail-closed). Returns (soft, reason)."""
     gating = prov.windows or []
     # Every hard condition is reported, and hard dominates a co-occurring over-pace window: we cannot
     # tell an unreadable window is not exhausted, so a partial payload (one window known and merely

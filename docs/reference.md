@@ -25,7 +25,8 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
 | `--auto-refresh` | Renew this worker's Claude access token when it expires, instead of reporting Claude unavailable until a human runs `claude` again. Off by default, and only safe when nothing else uses the same credential file — the refresh token is single-use, so the rotation logs out an interactive `claude`, a second refresher, or a copy of the credential elsewhere. See [quota and pacing](quota.md). |
-| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex\|claude`; unreadable usage and provider hard limits still stop the round. Kiro and OpenRouter agents do not use the subscription pacer. |
+| `--quota-reserve PERCENT` | Stop launching Codex or Claude when any reported window has less than this percentage remaining. Default `10`; `0` disables it. This is a hard guard, so `--ignore-quota` does not bypass it. |
+| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex\|claude`; the quota reserve, unreadable usage, and provider hard limits still stop the round. Kiro and OpenRouter agents do not use the subscription pacer. |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
 | `--pace T:B[,T:B...]` | Pacing curve as `time%:budget%` points (e.g. `0:10,50:70,90:90`): usage must remain below the interpolated budget; time 0/100 default to 0/100. Default is `60:40`; `0:0,100:100` gives the plain `used% < elapsed%` rule. |
 | `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its credential directories (`$HOME` on Linux; provider-specific Claude, Codex, and Kiro directories on macOS). |
@@ -99,12 +100,13 @@ the hold becomes inactive.
 
 The committed Codex authoring profile defaults to `gpt-6-sol`. Before the real
 authoring task, the worker makes a tiny read-only Sol access probe and caches the
-result for one hour for that worker and ChatGPT account. It selects
-`gpt-6-luna` only after two consecutive structured 400, 403, or 404 rejections
-that identify a model-access problem. Rate limits, server errors, context errors,
-malformed output, and ordinary failures pause the round without downgrading. Both
-probes are read-only, and the real authoring prompt is always executed exactly
-once.
+result for one hour for that worker and ChatGPT account. It selects `gpt-6-luna`
+only after two consecutive structured 400, 403, or 404 rejections identify a Sol
+model-access problem, and verifies Luna before it launches the real task. If both
+exact models are unavailable, the round pauses rather than launching an unverified
+fallback. Rate limits, server errors, context errors, malformed output, and
+ordinary failures pause the round without downgrading. All probes are read-only,
+and the real authoring prompt is always executed exactly once.
 
 An explicit `--author-model`, `TAUCETI_AUTHORING_CODEX_MODEL`, or legacy
 `TAUCETI_CODEX_MODEL` is a pin: it bypasses both the probe and the fallback.
@@ -177,6 +179,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
+| `TAUCETI_QUOTA_RESERVE` | `10` | Minimum percentage to keep unused in every Codex and Claude quota window. Launches stop below it; `0` disables the reserve. |
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
@@ -189,7 +192,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_INHERIT_CLAUDE_CONFIG` | _(unset)_ | `1` gives an isolated worker your own `CLAUDE.md`, `settings.json`, and skills instead of its own. Off by default: a round should not depend on whose config dir it ran from, and personal instructions can contradict the task prompt. |
-| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-6-sol` (Luna fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
+| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-6-sol` (verified `gpt-6-luna` fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
 | `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
 | `TAUCETI_AUTHORING_KIRO_MODEL` / `TAUCETI_AUTHORING_KIRO_EFFORT` | `gpt-5.6-sol` / `high` | Exact Kiro authoring profile. `claude-opus-5` selects Opus; Kiro Auto is never used. |
 | `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin, independent of the authoring model. Unset preserves the review engine's own default and fallback. |

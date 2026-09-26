@@ -48,6 +48,11 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
 PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "6d26dd3ebcee77d49c10355cce9daf632cc03325")
+# A full uv source URL permits a pinned, locally audited checkout during an emergency repair without
+# editing a disposable uvx environment. Production normally leaves this unset and uses GitHub.
+PROGRESS_SOURCE = os.environ.get(
+    "TAUCETI_PROGRESS_SOURCE", f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}"
+)
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
@@ -251,8 +256,8 @@ CODEX_AUTHORING_FALLBACK_MODEL = "gpt-6-luna"
 # side-effect-free access probe out of every round while still noticing an upgrade promptly.
 CODEX_MODEL_ACCESS_TTL = 3600
 AUTHORING_DEFAULTS = {
-    # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
-    # that this repository default is unavailable to the current subscription.
+    # Prefer flagship Sol for authoring. A cached preflight probe selects the verified Luna fallback
+    # only when Codex confirms that this repository default is unavailable.
     # Pin Claude to the current exact Opus generation, not its moving alias.
     "codex": ("gpt-6-sol", "high"),
     "claude": ("claude-opus-5-5", "high"),

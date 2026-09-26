@@ -44,6 +44,16 @@ class Meta:
 
 
 class ReviewState:
+    """One survey/round's caches, with concurrency partitioned by PR.
+
+    A survey may read distinct PRs concurrently: memo entries and cache paths are per-PR, and sidecar
+    writes use unique temporary files plus atomic replacement. It must finish observe() before those
+    tasks start and join them before the next observe(), bust(), or forced dispatch read. Reads for a
+    single PR remain sequential so the comment memo coalesces them. This is not a generally reentrant
+    cache: do not share one instance between overlapping surveys or same-PR tasks. Independent callers
+    (e.g. dashboard and round) use separate instances; on-disk freshness sidecars are self-contained.
+    """
+
     def __init__(self, cfg: Config, gh: GitHub):
         self.cfg = cfg
         self.gh = gh

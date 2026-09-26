@@ -42,7 +42,23 @@ checks.append(
         ["--cache-dir", f"/worker-state/cache/uvx/tauceti-progress/{tc.PROGRESS_REF}"],
     )
 )
+checks.append(check("progress tool uses the configured immutable source", progress_cmd[4], tc.PROGRESS_SOURCE))
 checks.append(check("progress tool still receives its command", progress_cmd[-1], "due"))
+
+progress_globals = tc.progress_argv.__globals__
+saved_progress_source = progress_globals["PROGRESS_SOURCE"]
+progress_globals["PROGRESS_SOURCE"] = "git+file:///srv/TauCetiProgress@deadbeef"
+try:
+    local_progress_cmd = tc.progress_argv(Path("/worker-state"), "due")
+finally:
+    progress_globals["PROGRESS_SOURCE"] = saved_progress_source
+checks.append(
+    check(
+        "progress tool accepts an audited local source override",
+        local_progress_cmd[4],
+        "git+file:///srv/TauCetiProgress@deadbeef",
+    )
+)
 
 # Drive the real cascade as well as its status predictor. A future edit must not let their shared
 # priority drift while leaving this display-only helper green.
@@ -95,10 +111,12 @@ checks.append(check("stale progress verdict falls through to fix-ci", seen, ["pr
 saved_prepare_checkout = tc.work_units.prepare_checkout
 saved_run = tc.work_units.subprocess.run
 writes = []
+plan_commands = []
 
 
 def fake_run(argv, *_a, **_k):
     if "plan" in argv:
+        plan_commands.append(argv)
         return SimpleNamespace(returncode=tc.EX_NOPROGRESS, stdout="", stderr="not due")
     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -117,6 +135,13 @@ with tempfile.TemporaryDirectory() as tmp:
         tc.work_units.subprocess.run = saved_run
 checks.append(check("fresh not-due plan returns the fallthrough signal", progress_result, None))
 checks.append(check("fresh plan re-check records the attempt", writes[0][0], "progress-attempt-ts"))
+checks.append(
+    check(
+        "progress bootstraps from main history",
+        plan_commands[0][plan_commands[0].index("--ref") + 1],
+        "origin/main",
+    )
+)
 
 # Bumps and rebases remain ahead of reporting.
 busy.bump.actionable.append(candidate)

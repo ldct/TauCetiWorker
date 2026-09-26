@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Default Codex authoring probes Sol safely, caches access, and runs no authoring prompt itself."""
+"""Default Codex authoring verifies Sol and its Luna fallback before running any authoring prompt."""
 
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,8 +26,8 @@ def check(name, got, want):
     fails += not ok
 
 
-def unavailable(status=400, message=None):
-    message = message or f"The '{SOL}' model is not supported when using Codex with a ChatGPT account."
+def unavailable(status=400, message=None, model=SOL):
+    message = message or f"The '{model}' model is not supported when using Codex with a ChatGPT account."
     payload = {"status": status, "error": {"type": "invalid_request_error", "message": message}}
     return json.dumps({"type": "turn.failed", "error": {"message": json.dumps(payload)}})
 
@@ -47,7 +48,7 @@ TRANSIENT = SimpleNamespace(returncode=1, stdout=unavailable(500) + "\n", stderr
 RAW_FALSE_POSITIVE = SimpleNamespace(returncode=1, stdout="error: model not found\n", stderr="")
 
 
-def run(sequence, *, repeat=False, explicit=False):
+def run(sequence, *, repeat=False, explicit=False, legacy_primary_miss=False):
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         home = root / "home"
@@ -66,6 +67,19 @@ def run(sequence, *, repeat=False, explicit=False):
             effort_source="repository default",
             fallback_model=None if explicit else LUNA,
         )
+        if legacy_primary_miss:
+            cache.mkdir(parents=True)
+            (cache / "codex-model-access.json").write_text(
+                json.dumps(
+                    {
+                        "fetched_at": int(time.time()),
+                        "fp": tc.Quota(cfg).codex_account_fingerprint(),
+                        "primary_model": SOL,
+                        "fallback_model": LUNA,
+                        "available": False,
+                    }
+                )
+            )
         calls = []
         outcomes = list(sequence)
         saved_run = tc.agents.subprocess.run
@@ -107,13 +121,38 @@ check("probe prompt is trivial, not an authoring prompt", argv[-1], "Reply with 
 check("probe closes stdin", kwargs.get("stdin"), subprocess.DEVNULL)
 check("probe strips API-key billing", "OPENAI_API_KEY" in kwargs.get("env", {}), False)
 
-selected, again, error, calls, remaining = run([UNAVAILABLE, UNAVAILABLE], repeat=True)
-check("two confirmed entitlement misses select Luna", (selected.model, error), (LUNA, None))
-check("Luna decision is cached without a third request", (again.model, len(calls), len(remaining)), (LUNA, 2, 0))
-check("both confirmations probe Sol only", [c[0][c[0].index("--model") + 1] for c in calls], [SOL, SOL])
+selected, again, error, calls, remaining = run([UNAVAILABLE, UNAVAILABLE, OK], repeat=True)
+check("two confirmed Sol misses select verified Luna", (selected.model, error), (LUNA, None))
+check(
+    "verified Luna decision is cached without another request", (again.model, len(calls), len(remaining)), (LUNA, 3, 0)
+)
+check(
+    "Sol is confirmed before probing Luna",
+    [c[0][c[0].index("--model") + 1] for c in calls],
+    [SOL, SOL, LUNA],
+)
 
 selected, _, error, calls, _ = run([UNAVAILABLE, OK])
-check("a successful confirmation keeps Sol", (selected.model, len(calls), error), (SOL, 2, None))
+check("a successful Sol confirmation keeps Sol", (selected.model, len(calls), error), (SOL, 2, None))
+
+selected, _, error, calls, remaining = run(
+    [
+        UNAVAILABLE,
+        UNAVAILABLE,
+        SimpleNamespace(returncode=1, stdout=unavailable(model=LUNA) + "\n", stderr=""),
+        SimpleNamespace(returncode=1, stdout=unavailable(model=LUNA) + "\n", stderr=""),
+    ]
+)
+check("two unavailable defaults stop rather than launch an unverified fallback", selected, None)
+check("two unavailable defaults report both model ids", (SOL in error, LUNA in error), (True, True))
+check("both models receive two entitlement confirmations", (len(calls), len(remaining)), (4, 0))
+
+selected, _, error, calls, remaining = run([UNAVAILABLE, UNAVAILABLE, OK], legacy_primary_miss=True)
+check(
+    "legacy primary-miss cache is revalidated before fallback launch",
+    (selected.model, len(calls), error),
+    (LUNA, 3, None),
+)
 
 for name, outcome in (
     ("ordinary failure", ORDINARY),

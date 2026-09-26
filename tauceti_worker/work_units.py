@@ -317,7 +317,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
         # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken
         # credential when the answer was an HTTP 504 from the GraphQL gateway, retried out of a round.
-        why = one_line("; ".join(sv.errors)) or "the open PR query failed (GitHub API?)"
+        why = one_line("; ".join(sv.errors), 2200) or "the open PR query failed (GitHub API?)"
         raise NoProgress(f"{why} — aborting round, not falling through to authoring")
 
     log(f"open PRs: {sv.status_label_line()}")
@@ -882,6 +882,13 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # in fact posted, contradicting the "errored Nx without posting a verdict" message.
             w.counters.write(errkey, 0)
             clear_review_failure(w.cfg.state, pr)
+            # Notifications are also keyed to the authenticated GitHub account, so mute the PR's
+            # thread only after the engine has confirmed its post. This is deliberately best-effort:
+            # a failure here must neither invalidate nor replay the posted review.
+            try:
+                w.gh.ignore_pr_notifications(pr)
+            except Exception:
+                log(f"  review #{pr}: disabling PR notifications FAILED unexpectedly; review remains successful")
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. The posted scoreboard is the live
             # auto-merge verdict; TauCetiData is the analytics/provenance archive, so a sync failure is
@@ -1341,6 +1348,11 @@ def _do_progress_inner(w, opts) -> int | None:
         str(roadmap_dir),
         "--code-dir",
         str(w.cfg.checkout),
+        # Bootstrap against all merged work, including areas newer than the docs branch.
+        # The planner still caps the report at the published documentation's source SHA
+        # and defers areas whose first merge has not been documented yet.
+        "--ref",
+        "origin/main",
         "--out",
         str(plan_file),
         capture=True,
