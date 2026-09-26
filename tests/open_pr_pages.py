@@ -46,8 +46,10 @@ def node(number, *, build=None, author="kim", bot=False, labels=("awaiting-revie
         "headRepository": {"name": "TauCeti"},
         "updatedAt": "2026-09-17T01:00:00Z",
         "author": {"login": author, "__typename": "Bot" if bot else "User"},
-        "labels": {"nodes": [{"name": n} for n in labels]},
-        "commits": {"nodes": [{"commit": {"status": {"contexts": contexts} if contexts else None}}]},
+        "labels": {"totalCount": len(labels), "nodes": [{"name": n} for n in labels]},
+        "commits": {
+            "nodes": [{"commit": {"oid": f"head{number}", "status": {"contexts": contexts} if contexts else None}}]
+        },
     }
 
 
@@ -121,7 +123,7 @@ check("a PR repeated across pages appears once", [d["number"] for d in gh.open_p
 # --- refusing to truncate ---------------------------------------------------
 # The whole point of paging: a survey that cannot see every open PR must FAIL, because a short list
 # reads exactly like a quiet project and would silently drop work.
-gh = FakeGH([page([node(i)], more=True) for i in range(tc.OPEN_PR_MAX_PAGES + 5)])
+gh = FakeGH([page([node(i)], more=True, cursor=f"C{i}") for i in range(tc.OPEN_PR_MAX_PAGES + 5)])
 try:
     gh.open_prs()
     check("running out of pages raises", False, True)

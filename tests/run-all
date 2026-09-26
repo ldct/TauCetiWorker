@@ -66,6 +66,8 @@ RUN_STDLIB=(
   fleet_capacity.py
   github_accounts.py
   github_failure_reason.py
+  github_app.py
+  github_app_setup.py
   github_ratelimit.py
   github_shared_transport.py
   github_cli_metadata.py
@@ -79,6 +81,8 @@ RUN_STDLIB=(
   global_maintenance.py
   shared_state_outage.py
   github_pause.py
+  github_diagnostics.py
+  github_survey_query.py
   host_agent_preflight.py
   host_build_cache.py
   ignore_quota_hardblock.py
@@ -121,13 +125,16 @@ RUN_STDLIB=(
   quota_launch_stage.py
   quota_codex_windows.py
   quota_reason.py
+  quota_reserve.py
   review_codex_model.py
   review_mathlib_source.py
   review_diagnostics.py
+  review_notification_unsubscribe.py
   review_provider_down.py
   review_outcomes.py
   review_scheduling.py
   review_state_freshness.py
+  review_state_concurrency.py
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
@@ -145,6 +152,7 @@ RUN_STDLIB=(
   spread_candidates.py
   ssl_cert_file.py
   status_labels.py
+  survey_concurrency.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py

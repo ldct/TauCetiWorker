@@ -44,7 +44,23 @@ checks.append(
         ["--cache-dir", f"/worker-state/cache/uvx/tauceti-progress/{tc.PROGRESS_REF}"],
     )
 )
+checks.append(check("progress tool uses the configured immutable source", progress_cmd[4], tc.PROGRESS_SOURCE))
 checks.append(check("progress tool still receives its command", progress_cmd[-1], "due"))
+
+progress_globals = tc.progress_argv.__globals__
+saved_progress_source = progress_globals["PROGRESS_SOURCE"]
+progress_globals["PROGRESS_SOURCE"] = "git+file:///srv/TauCetiProgress@deadbeef"
+try:
+    local_progress_cmd = tc.progress_argv(Path("/worker-state"), "due")
+finally:
+    progress_globals["PROGRESS_SOURCE"] = saved_progress_source
+checks.append(
+    check(
+        "progress tool accepts an audited local source override",
+        local_progress_cmd[4],
+        "git+file:///srv/TauCetiProgress@deadbeef",
+    )
+)
 
 # Drive the real cascade as well as its status predictor. A future edit must not let their shared
 # priority drift while leaving this display-only helper green.

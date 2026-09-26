@@ -12,6 +12,8 @@ import re
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,10 +37,10 @@ from .constants import (
     MAX_REVIEW_CONTESTS,
     MAX_REVIEW_CONTESTS_PER_RUBRIC,
     MAX_REVIEW_ERRORS,
-    PROGRESS,
     PROGRESS_ATTEMPT_GAP,
     PROGRESS_ERROR_KEY,
     PROGRESS_REF,
+    PROGRESS_SOURCE,
     PROGRESS_TTL,
     REVIEW_AFFINITY_GRACE_S,
     REVIEW_AGE_CAP_S,
@@ -570,7 +572,7 @@ def progress_argv(state: Path, *args: str) -> list[str]:
         "--cache-dir",
         str(cache),
         "--from",
-        f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}",
+        PROGRESS_SOURCE,
         "tauceti-progress",
         *args,
     ]
@@ -685,6 +687,108 @@ def bust_progress_cache(cfg: Config) -> None:
         pass
 
 
+# Six concurrent read-only PR checks bound GitHub request pressure. Within a PR, keep
+# reads sequential so scoreboard and contest checks share ReviewState's comment memo.
+SURVEY_WORKERS = 6
+
+
+def _survey_review(
+    p: PRInfo,
+    gh: GitHub,
+    rs: ReviewState,
+    counters: Counters,
+    deep: bool,
+    cached_only: bool,
+    history_ready: Callable[[PRInfo], bool],
+) -> Survey:
+    """Evaluate one PR's review eligibility without mutating the aggregate survey."""
+    sv = Survey(worker_id="")
+    if {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
+        return sv
+    if not p.build_success:
+        return sv
+    if not deep:
+        sv.reviewable.actionable.append(
+            Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
+        )
+        return sv
+    if not history_ready(p):
+        # A partial projection is not an empty history. Let the review engine
+        # inspect the selected PR and coordinate its real per-head claim.
+        # Author-action PRs are handled by their writer instead.
+        if "awaiting-author" not in p.labels and "ready-to-merge" not in p.labels:
+            c = Candidate(
+                p.number,
+                p.head_oid,
+                "build-green; review history incomplete, investigate in review engine",
+                attempts=counters.read(f"review-err-{p.number}"),
+                budget=MAX_REVIEW_ERRORS,
+                ready_at=p.build_status_at,
+                partial_history=True,
+            )
+            (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
+        return sv
+    m = rs.gh_meta(p.number)
+    if rs.ledger_clean_head(p.number) != p.head_oid:
+        # normal review path: the head moved or the last round errored.
+        c = Candidate(
+            p.number,
+            p.head_oid,
+            "build-green, head not cleanly reviewed",
+            attempts=counters.read(f"review-err-{p.number}"),
+            budget=MAX_REVIEW_ERRORS,
+            ready_at=p.build_status_at,
+            preferred_reviewer=_scoreboard_reviewer(m),
+        )
+        if not p.automatic_bump and c.attempts >= c.budget:
+            sv.reviewable.suppressed.append(c)
+            sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
+            return sv
+        sv.reviewable.actionable.append(c)
+        return sv
+    # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
+    # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
+    # reply with a higher id is one no review round has answered yet — precise (monotonic id),
+    # with no second-resolution ambiguity, and self-clearing (the contest round advances
+    # replies_through past it).
+    reply = rs.newest_contest_reply(p.number)
+    if not reply:
+        return sv
+    through = m.data.get("replies_through")
+    through = through if isinstance(through, int) else 0
+    if reply["id"] <= through:
+        return sv  # already adjudicated by some review round
+    # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
+    # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
+    # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.
+    # Global discovery never reads reactions for every contest. Dispatch
+    # rechecks the selected reply's claim immediately before launching.
+    age = None if cached_only else gh.fresh_claim_age(reply["id"])
+    if age is not None and age < CONTEST_CLAIM_TTL:
+        return sv
+    rubric = reply["rubric"]
+    c = Candidate(
+        p.number,
+        p.head_oid,
+        f"author contest on {rubric}",
+        contest=rubric,
+        contest_reply_id=reply["id"],
+        attempts=counters.read(f"review-contest-{p.number}"),
+        budget=MAX_REVIEW_CONTESTS,
+        ready_at=_parse_iso8601(reply.get("created_at")),
+        preferred_reviewer=_scoreboard_reviewer(m),
+    )
+    if not p.automatic_bump and (
+        counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
+        or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
+        or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS
+    ):
+        sv.reviewable.suppressed.append(c)
+    else:
+        sv.reviewable.actionable.append(c)
+    return sv
+
+
 def survey(
     cfg: Config,
     gh: GitHub,
@@ -697,6 +801,7 @@ def survey(
     numbers=(),
     count_all_roadmaps=False,
     cached_only=False,
+    progress: Callable[[str], None] | None = None,
 ) -> Survey:
     """Classify relevant open PRs per enabled work-kind, without writes or model work.
 
@@ -705,6 +810,8 @@ def survey(
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
     always uses deep=True.
     """
+    if progress:
+        progress("Fetching open PRs from GitHub…")
     began = time.monotonic()
     _f = selected_roadmap if selected_roadmap is not None else roadmap_only()
     enabled = set(AUTO_STAGES if stages is None else stages)
@@ -800,6 +907,8 @@ def survey(
             and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         )
     ]
+    if progress:
+        progress("Checking GitHub identity and permissions…")
     me_login = me()
     sv.me_login = me_login
     mine = [p for p in nondraft if p.author == me_login]
@@ -923,91 +1032,28 @@ def survey(
     #    OR a fresh author CONTEST reply landed since the last review at a clean head (→ contest path,
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without completing a review is escalated, not silently dropped.
-    for p in nondraft if "review" in enabled else []:
-        if {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
-            continue
-        if not p.build_success:
-            continue
-        if not deep:
-            sv.reviewable.actionable.append(
-                Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
-            )
-            continue
-        if not history_ready(p):
-            # A partial projection is not an empty history. Let the review engine
-            # inspect the selected PR and coordinate its real per-head claim.
-            # Author-action PRs are handled by their writer instead.
-            if "awaiting-author" not in p.labels and "ready-to-merge" not in p.labels:
-                c = Candidate(
-                    p.number,
-                    p.head_oid,
-                    "build-green; review history incomplete, investigate in review engine",
-                    attempts=counters.read(f"review-err-{p.number}"),
-                    budget=MAX_REVIEW_ERRORS,
-                    ready_at=p.build_status_at,
-                    partial_history=True,
-                )
-                (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
-            continue
-        m = rs.gh_meta(p.number)
-        if rs.ledger_clean_head(p.number) != p.head_oid:
-            # normal review path: the head moved or the last round errored.
-            c = Candidate(
-                p.number,
-                p.head_oid,
-                "build-green, head not cleanly reviewed",
-                attempts=counters.read(f"review-err-{p.number}"),
-                budget=MAX_REVIEW_ERRORS,
-                ready_at=p.build_status_at,
-                preferred_reviewer=_scoreboard_reviewer(m),
-            )
-            if not p.automatic_bump and c.attempts >= c.budget:
-                sv.reviewable.suppressed.append(c)
-                sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
-                continue
-            sv.reviewable.actionable.append(c)
-            continue
-        # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
-        # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
-        # reply with a higher id is one no review round has answered yet — precise (monotonic id),
-        # with no second-resolution ambiguity, and self-clearing (the contest round advances
-        # replies_through past it).
-        reply = rs.newest_contest_reply(p.number)
-        if not reply:
-            continue
-        through = m.data.get("replies_through")
-        through = through if isinstance(through, int) else 0
-        if reply["id"] <= through:
-            continue  # already adjudicated by some review round
-        # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
-        # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
-        # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.
-        # Global discovery never reads reactions for every contest. Dispatch
-        # rechecks the selected reply's claim immediately before launching.
-        age = None if cached_only else gh.fresh_claim_age(reply["id"])
-        if age is not None and age < CONTEST_CLAIM_TTL:
-            continue
-        rubric = reply["rubric"]
-        c = Candidate(
-            p.number,
-            p.head_oid,
-            f"author contest on {rubric}",
-            contest=rubric,
-            contest_reply_id=reply["id"],
-            attempts=counters.read(f"review-contest-{p.number}"),
-            budget=MAX_REVIEW_CONTESTS,
-            ready_at=_parse_iso8601(reply.get("created_at")),
-            preferred_reviewer=_scoreboard_reviewer(m),
-        )
-        if not p.automatic_bump and (
-            counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
-            or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
-            or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS
-        ):
-            sv.reviewable.suppressed.append(c)
-        else:
-            sv.reviewable.actionable.append(c)
+    review_prs = [p for p in nondraft if p.build_success] if "review" in enabled else []
+    results = {}
+    if progress:
+        progress(f"Checking PR reviews: 0/{len(review_prs)}")
+    with ThreadPoolExecutor(max_workers=SURVEY_WORKERS, thread_name_prefix="survey") as pool:
+        pending = {
+            pool.submit(_survey_review, p, gh, rs, counters, deep, cached_only, history_ready): p.number
+            for p in review_prs
+        }
+        for future in as_completed(pending):
+            results[pending[future]] = future.result()
+            if progress:
+                progress(f"Checking PR reviews: {len(results)}/{len(review_prs)}")
+    # Completion order depends on network latency; keep the original GitHub PR order for callers.
+    for p in review_prs:
+        result = results[p.number]
+        sv.reviewable.actionable.extend(result.reviewable.actionable)
+        sv.reviewable.suppressed.extend(result.reviewable.suppressed)
+        sv.review_stuck.extend(result.review_stuck)
 
+    if progress:
+        progress("Checking author tasks…")
     if deep and "fix" in enabled:
         # 3) fix: tended (ours or bot-authored), reviewed-at-head, latest rubric blocking, under
         #    budgets. Bump PRs get reviewed like any other, so a blocking rubric on one is ours to fix
@@ -1161,6 +1207,8 @@ def survey(
         if not any(u.get("overlap") for u in project.raw.get("upstreams", [])):
             enabled -= {"overlap-scan", "overlap-fix"}
     if deep and "progress" in enabled:
+        if progress:
+            progress("Checking progress-report eligibility…")
         due, reason = progress_due(cfg, counters)
         c = Candidate(0, "", reason or "progress report")
         (sv.progress.actionable if due else sv.progress.suppressed).append(c)

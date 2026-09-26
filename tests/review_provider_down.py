@@ -66,7 +66,11 @@ def fake_worker(state):
         cfg=types.SimpleNamespace(state=state, logdir=state, wid="w", store_dir=state / "store"),
         counters=Counters(),
         rs=types.SimpleNamespace(bust=lambda pr: None, review_rounds=lambda pr, c: 0),
-        gh=types.SimpleNamespace(add_reaction=lambda i: True, remove_reaction=lambda i: True),
+        gh=types.SimpleNamespace(
+            add_reaction=lambda i: True,
+            remove_reaction=lambda i: True,
+            ignore_pr_notifications=lambda pr: True,
+        ),
     )
 
 

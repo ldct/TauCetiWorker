@@ -428,7 +428,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
         # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken
         # credential when the answer was an HTTP 504 from the GraphQL gateway, retried out of a round.
-        why = one_line("; ".join(sv.errors)) or "the open PR query failed (GitHub API?)"
+        why = one_line("; ".join(sv.errors), 2200) or "the open PR query failed (GitHub API?)"
         raise NoProgress(f"{why} — aborting round, not falling through to authoring")
 
     log(f"open PRs: {sv.status_label_line()}")
@@ -1316,6 +1316,13 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # Both changed and unchanged success prove the review is published.
             w.counters.write(errkey, 0)
             clear_review_failure(w.cfg.state, pr)
+            # Notifications are also keyed to the authenticated GitHub account, so mute the PR's
+            # thread only after the engine has confirmed its post. This is deliberately best-effort:
+            # a failure here must neither invalidate nor replay the posted review.
+            try:
+                w.gh.ignore_pr_notifications(pr)
+            except Exception:
+                log(f"  review #{pr}: disabling PR notifications FAILED unexpectedly; review remains successful")
             try:
                 result = json.loads(result_file.read_text())
             except (OSError, ValueError):
