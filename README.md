@@ -58,6 +58,8 @@ tauceti status                     # the same survey, non-interactive (--json fo
 tauceti usage --json               # prompt-free Kiro/OpenRouter credit telemetry
 tauceti work --only review         # one round of a specific kind of work, then exit
 tauceti work --loop --only review  # a focused worker: keep reviewing (or fix / roadmap / ...)
+tauceti work --loop --only review,progress # no Lean toolchain; reviews and report PRs
+tauceti work --loop --skip review,progress # complementary build/authoring fleet
 tauceti work --loop                # fully automatic: keep picking the most useful job
 ```
 
@@ -388,3 +390,13 @@ and that bootstrap in detail.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
+
+### Fleets without a Lean toolchain
+
+`--only review,progress` needs Git, GitHub credentials, uvx and the agent CLI, but
+not Lake/Lean/Mathlib. Review uses the review engine; progress generates reports
+from git history and can push/open PRs in TauCetiRoadmap. Progress refreshes source
+without hydrating Mathlib or touching Lake artifact caches. It still needs disk
+for source history and its report workspace. `--skip review,progress` selects the
+complementary build/authoring tasks and retains the normal toolchain preflight.
+Task order and global progress cadence/claim coordination are unchanged.

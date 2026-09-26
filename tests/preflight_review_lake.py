@@ -34,17 +34,37 @@ CFG = SimpleNamespace()  # review-host preflight never touches cfg (uses_fork ex
 
 raised = False
 try:
-    tc.cli.preflight(CFG, opts(["review"]))
+    tc.cli.preflight(CFG, opts(["review", "progress"]))
 except tc.Die:
     raised = True
-check("host review without lake is NOT blocked", not raised)
+check("host review+progress without lake is NOT blocked", not raised)
 
-# Guard the other direction: an authoring stage (fix) on the host STILL needs lake.
-raised = False
-try:
-    tc.cli.preflight(CFG, opts(["fix"]))
-except tc.Die as e:
-    raised = "lake" in str(e)
-check("host fix without lake IS blocked (lake still required for authoring)", raised)
+for tasks in (["review"], ["progress"]):
+    tc.cli.preflight(CFG, opts(tasks))
+    check(f"{tasks} needs no lake", True)
+
+# Every other host task still needs the build toolchain, including mixed fleets.
+for tasks in (
+    ["fix"],
+    ["rebase"],
+    ["bump"],
+    ["lint-repair"],
+    ["fix-ci"],
+    ["roadmap"],
+    ["review", "progress", "fix"],
+    [],
+):
+    raised = False
+    try:
+        tc.cli.preflight(CFG, opts(tasks))
+    except tc.Die as e:
+        raised = "lake" in str(e)
+    check(f"host {tasks or 'all'} without lake IS blocked", raised)
+
+light = set(tc.cli.resolve_tasks(["review,progress"], []))
+heavy = set(tc.cli.resolve_tasks([], ["review,progress"]))
+check("fleets are disjoint", not light & heavy)
+check("fleets cover all tasks", light | heavy == set(tc.ALLOWED_TASKS))
+check("light fleet is exactly review+progress", light == {"review", "progress"})
 
 sys.exit(1 if fails else 0)

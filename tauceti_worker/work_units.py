@@ -1312,8 +1312,8 @@ def _do_progress_inner(w, opts) -> int | None:
         if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
             raise Die(f"cloning {ROADMAP} failed")
 
-    # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
-    if not prepare_checkout(w.cfg):
+    # `plan` and `facts` read git history only; do not hydrate any build caches.
+    if not prepare_checkout(w.cfg, source_only=True):
         raise Die("checkout failed")
 
     work = w.cfg.state / "progress" / "work"

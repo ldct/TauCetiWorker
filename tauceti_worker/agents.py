@@ -560,9 +560,10 @@ def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
         log(f"Lake artifact cache: cleanup completed but could not update toolchain marker ({e})")
 
 
-def prepare_checkout(cfg: Config) -> bool:
+def prepare_checkout(cfg: Config, *, source_only: bool = False) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
-    sync_mathlib_pool(cfg)
+    if not source_only:
+        sync_mathlib_pool(cfg)
     co = cfg.checkout
     if not (co / ".git").is_dir():
         co.parent.mkdir(parents=True, exist_ok=True)
@@ -583,7 +584,8 @@ def prepare_checkout(cfg: Config) -> bool:
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.
-    clean_lake_cache_after_toolchain_bump(cfg)
+    if not source_only:
+        clean_lake_cache_after_toolchain_bump(cfg)
     g("clean", "-fdxq", "-e", ".lake")
     return True
 
