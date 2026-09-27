@@ -21,13 +21,12 @@ If the branch already includes current `main` and no concrete repair is needed, 
 
 Merging upstream workflow or pin changes as part of bringing in `main` is expected. Do not author independent changes to those human-owned files. The sweep request is bound to the old head; after a successful push it no longer schedules rebase work. Do not remove the request label yourself or reset any attempt counter.
 
-## Verify before pushing (all three MUST pass, after the merge/rebase)
+## Verify before pushing (after the merge/rebase)
 ```
 lake exe cache get
 lake build
-lake exe axioms
 ```
-Iterate until green. Never push red — a botched conflict resolution that builds red is worse than the conflict.
+Iterate until green. Never push red — a botched conflict resolution that builds red is worse than the conflict. Do not run the full axiom audit locally; trusted CI runs it on the submitted commit. Reject `sorry`, `native_decide`, new axioms, and `maxHeartbeats` overrides while reviewing the resolved diff.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. When a repair is needed, do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
@@ -41,4 +40,4 @@ Iterate until green. Never push red — a botched conflict resolution that build
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: which files conflicted, how you resolved each, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: which files conflicted, how you resolved each, and the exact `lake build` result line proving the local build is green. Trusted CI performs the full axiom audit on the submitted commit. Do not claim green unless you saw it.

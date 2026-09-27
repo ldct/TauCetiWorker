@@ -133,6 +133,16 @@ def main():
             prompt.count('--base-root "$base_root"') == 2,
         )
 
+    # Full repository axiom audits are a trusted-CI gate, not a routine per-checkout task. Running
+    # one in every authoring checkout exhausts macOS vnodes without adding merge safety. FIX-CI may
+    # still request one conditionally when the failing CI job is specifically the axiom audit.
+    for name in ("fix.md", "rebase.md", "bump.md", "roadmap.md", "lint-repair.md"):
+        prompt = (PROMPTS / name).read_text()
+        check(f"{name}: has no unconditional local axiom command", "\nlake exe axioms\n" not in prompt)
+        check(f"{name}: leaves the full axiom audit to trusted CI", "trusted CI" in prompt)
+    fix_ci = (PROMPTS / "fix-ci.md").read_text()
+    check("fix-ci.md: local axiom audit is conditional", "only when the failed CI log specifically reports" in fix_ci)
+
     # 5) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
     # copied from other contributors' intention issues, which is untrusted and documented as
     # fail-open: a claim containing a `__WORD__` must not abort the round, and one containing a real
