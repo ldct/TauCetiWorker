@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import tauceti_worker as tc
 
 wu = importlib.import_module("tauceti_worker.work_units")
+ghmod = importlib.import_module("tauceti_worker.github")
 gh = tc.GitHub("owner/repo")
 
 
@@ -26,6 +27,21 @@ def failure(stderr, stdout="", rc=1):
             return str(exc)
     raise AssertionError("failed command did not raise")
 
+
+# Identity lookup must not accept GitHub's error body as a login name.
+ghmod.me.cache_clear()
+with patch.object(
+    ghmod,
+    "gh_run",
+    return_value=subprocess.CompletedProcess([], 1, "API rate limit exceeded for user ID 1", ""),
+):
+    try:
+        ghmod.me()
+    except tc.Die:
+        pass
+    else:
+        raise AssertionError("failed identity lookup accepted GitHub's error body as a login")
+ghmod.me.cache_clear()
 
 message = failure("GraphQL: API rate limit exceeded")
 assert "repo=owner/repo, state=all, author=someone, exit=1" in message
@@ -48,7 +64,10 @@ assert sv.github_failed and sv.errors == [message]
 # Regression: work used to discard this stored diagnostic and print a generic message.
 with patch.object(wu, "survey", return_value=sv):
     try:
-        wu.run_round(SimpleNamespace(cfg=None, gh=None, rs=None, counters=None), SimpleNamespace(dry_run=True))
+        wu.run_round(
+            SimpleNamespace(cfg=None, gh=None, rs=None, counters=None),
+            SimpleNamespace(dry_run=True, only=[], prs=()),
+        )
     except tc.NoProgress as exc:
         assert message in str(exc) and "aborting round" in str(exc)
     else:
