@@ -44,9 +44,10 @@ check(
         "--sandbox",
         "danger-full-access",
         "--skip-git-repo-check",
-        P,
+        "-",
     ],
 )
+check("codex prompt is absent from argv", P in a, False)
 assert "OPENAI_API_KEY" not in env, "codex env must drop OPENAI_API_KEY (bills the ChatGPT plan)"
 print("[OK ] codex env drops OPENAI_API_KEY")
 
@@ -96,8 +97,8 @@ check("kiro model is explicit (never Auto)", "auto" in [arg.lower() for arg in a
 assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
 print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
 
-# Agent prompts are always passed in argv. In Bubble, an inherited terminal crosses SSH as a non-TTY
-# stream; Codex then waits for more prompt text until EOF. Both output modes must close stdin.
+# Host Codex receives its prompt over stdin; every other host provider keeps stdin closed. In Bubble,
+# an inherited terminal crosses SSH as a non-TTY stream, so its argv-based prompt must also see EOF.
 saved_popen = tc.agents.subprocess.Popen
 saved_stream = os.environ.get("TAUCETI_STREAM")
 saved_runtime_status = os.environ.get(tc.runtime_status.STATUS_ENV)
@@ -107,6 +108,7 @@ calls = []
 class FakeProc:
     def __init__(self, output="", returncode=0):
         self.stdout = io.StringIO(output)
+        self.stdin = CaptureStdin()
         self.returncode = returncode
 
     def wait(self):
@@ -116,7 +118,26 @@ class FakeProc:
         pass
 
 
-tc.agents.subprocess.Popen = lambda *a, **k: calls.append(k) or FakeProc()
+class CaptureStdin:
+    def __init__(self):
+        self.text = ""
+        self.closed = False
+
+    def write(self, value):
+        self.text += value
+
+    def close(self):
+        self.closed = True
+
+
+def capture_popen(*_args, **kwargs):
+    proc = FakeProc()
+    kwargs["proc"] = proc
+    calls.append(kwargs)
+    return proc
+
+
+tc.agents.subprocess.Popen = capture_popen
 try:
     with tempfile.TemporaryDirectory() as td:
         os.environ["TAUCETI_STREAM"] = "1"
@@ -125,6 +146,18 @@ try:
         os.environ.pop("TAUCETI_STREAM")
         tc.run_agent_proc(["agent"], env={}, logdir=Path(td), label="test", provider="deepseek")
         check("logged agent stdin is closed", calls[-1].get("stdin"), tc.agents.subprocess.DEVNULL)
+
+        tc.run_agent_proc(
+            ["codex", "exec", "-"],
+            env={},
+            logdir=Path(td),
+            label="agent-codex",
+            provider="codex",
+            stdin_text=P,
+        )
+        check("Codex prompt stdin uses a pipe", calls[-1].get("stdin"), tc.agents.subprocess.PIPE)
+        check("Codex prompt is written to stdin", calls[-1]["proc"].stdin.text, P)
+        check("Codex prompt stdin is closed", calls[-1]["proc"].stdin.closed, True)
 
         transcript_events = (
             "\n".join(

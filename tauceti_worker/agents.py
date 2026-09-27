@@ -633,7 +633,10 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         if profile.effort:
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
         argv += ["-c", 'model_reasoning_summary="detailed"', "-c", "show_raw_agent_reasoning=false"]
-        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
+        # Keep the potentially large, path-heavy authoring prompt out of argv. Besides avoiding the
+        # platform command-line limit, this prevents endpoint-security products from interpreting
+        # prompt contents as executable paths. `codex exec -` is the CLI's explicit stdin form.
+        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", "-"]
     elif profile.provider == "kiro":
         # --model is mandatory: Kiro's Auto router is never allowed to choose on
         # the worker's behalf. Isolate its platform credential store for API-key
@@ -675,6 +678,7 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
         logdir=logdir,
         label=f"agent-{profile.provider}",
         provider=profile.provider,
+        stdin_text=prompt if profile.provider == "codex" else None,
     )
 
 
@@ -771,6 +775,7 @@ def run_agent_proc(
     label: str,
     provider: str,
     cwd: Path | None = None,
+    stdin_text: str | None = None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
@@ -802,13 +807,25 @@ def run_agent_proc(
             argv,
             cwd=cwds,
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             errors="replace",
             bufsize=1,
         )
+        if stdin_text is not None:
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(stdin_text)
+            except BrokenPipeError:
+                # Preserve the subprocess's real exit and diagnostic if it dies before reading.
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
         assert proc.stdout is not None
         try:
             for line in proc.stdout:
