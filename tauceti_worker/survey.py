@@ -381,7 +381,9 @@ class Survey:
             if automatic is not None
             else roadmap_open_count(self._mine_open_prs, self.roadmap_only, self.roadmap_skip)
         )
-        self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs
+        # Auto resolves its concrete candidates in do_roadmap; an aggregate count must
+        # not prevent it from looking for an area with capacity.
+        self.roadmap_backpressure = self.roadmap_only != "auto" and self.n_mine_open >= self.max_open_prs
         self.next_auto_stage = _next_auto_stage(self)
 
     def status_label_line(self) -> str:
