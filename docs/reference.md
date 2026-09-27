@@ -36,8 +36,10 @@ list is in `tauceti work -h`. For persistent workers, see
 ## Roadmap backpressure
 
 The open-PR backpressure limit follows the roadmap scope you select. A pinned
-area counts only your open PRs identified for that area; an all-areas or
-automatic run counts roadmap PRs in every non-skipped area. Drafts, non-roadmap
+area counts only your open PRs identified for that area. Automatic mode picks randomly
+among non-skipped areas with fewer than 8 of your open PRs; it stops authoring only
+when every eligible area is at the cap. The explicit all-areas mode
+(`--roadmap-only ""`) retains an aggregate cap across non-skipped areas. Drafts, non-roadmap
 PRs, and PRs for roadmaps outside the selected scope do not consume its authoring
 limit. An open roadmap PR whose area is temporarily unknown counts conservatively
 in every scope until its area label resolves.

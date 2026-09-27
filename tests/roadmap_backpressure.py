@@ -6,6 +6,7 @@ import os
 import sys
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import tauceti_worker as tc
@@ -167,6 +168,46 @@ def main():
         sv.rescope_roadmap()
         check("live rescope recomputes the selected area's count", sv.n_mine_open, tc.MAX_OPEN_PRS)
         check("live rescope recomputes the backpressure flag", sv.roadmap_backpressure, True)
+
+        sv.roadmap_only = "auto"
+        sv.rescope_roadmap()
+        check("aggregate count above cap does not block auto", sv.roadmap_backpressure, False)
+        check("auto can reach roadmap selection", sv.next_auto_stage, "roadmap")
+
+        units = importlib.import_module("tauceti_worker.work_units")
+        worker = types.SimpleNamespace(gh=FakeGH())
+
+        class Selected(Exception):
+            pass
+
+        def select(areas, skipped=()):
+            # Stop at the first downstream operation, after selection but before any side effect.
+            with (
+                patch.object(units, "roadmap_areas", return_value=areas),
+                patch.object(units, "roadmap_skip", return_value=list(skipped)),
+                patch.object(units.random, "choice", side_effect=lambda xs: xs[0]) as choice,
+                patch.object(units, "administrative_hold_avoid_list", side_effect=Selected),
+            ):
+                try:
+                    units.do_roadmap(worker, sv, tc.Candidate(0, "", "auto"), None, None)
+                except Selected:
+                    return choice.call_args.args[0]
+                except tc.NoProgress as e:
+                    return str(e)
+
+        check(
+            "auto excludes capped area, retains low and empty areas",
+            select(["Topology", "PDE", "Algebra"]),
+            ["PDE", "Algebra"],
+        )
+        check("auto respects skipped areas", select(["Topology", "PDE", "Algebra"], ["PDE"]), ["Algebra"])
+        check("all capped areas stop authoring", "backpressure" in select(["Topology"]), True)
+        check("all skipped areas stop authoring", "every area" in select(["PDE"], ["PDE"]), True)
+        check("empty area lookup does not bypass cap", "cannot check" in select([]), True)
+        saved = sv._mine_open_prs
+        sv._mine_open_prs = [pr(i, "roadmap/Unknown") for i in range(tc.MAX_OPEN_PRS)]
+        check("unknown areas count against every candidate", "backpressure" in select(["PDE", "Algebra"]), True)
+        sv._mine_open_prs = saved
 
         os.environ["TAUCETI_ROADMAP_ONLY"] = ""
         os.environ["TAUCETI_ROADMAP_SKIP"] = "Topology"

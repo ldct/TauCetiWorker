@@ -1496,8 +1496,21 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         areas = [a for a in raw_areas if a not in skip]
         if raw_areas and not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
             raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
-        only = random.choice(areas) if areas else "any"
-        log(f"→ ROADMAP area: {only} (auto-picked from {len(areas)} areas, skipping {len(skip)})")
+        if not raw_areas:
+            raise NoProgress("roadmap: no areas available — cannot check per-area capacity")
+        from .survey import roadmap_open_count
+
+        available = [a for a in areas if roadmap_open_count(sv._mine_open_prs, a, []) < MAX_OPEN_PRS]
+        if not available:
+            raise NoProgress(
+                f"roadmap: all {len(areas)} eligible areas have >= {MAX_OPEN_PRS} open PRs "
+                "— backpressure, not authoring"
+            )
+        only = random.choice(available)
+        log(
+            f"→ ROADMAP area: {only} (auto-picked from {len(available)} areas with capacity, "
+            f"{len(areas) - len(available)} at cap, skipping {len(skip)})"
+        )
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
         log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is
