@@ -243,10 +243,8 @@ def test_load_token():
 
 
 def test_random_default():
-    """The new default: with no area pinned, do_roadmap resolves "auto" to a random roadmap area
-    (and falls back to "all areas" when the area list can't be fetched). --roadmap-skip removes
-    areas from the random pick and is injected into the prompt. Stub the IO so only the
-    area-resolution + prompt substitution runs."""
+    """With no area pinned, do_roadmap resolves "auto" to a random area with capacity.
+    --roadmap-skip removes areas from the pick; an unavailable area list fails closed."""
     captured = {}
     orig = {
         k: getattr(tc.work_units, k)
@@ -263,7 +261,7 @@ def test_random_default():
     tc.work_units.fetch_ref = lambda *a, **k: True
     tc.work_units.ensure_fork = lambda: "alice/TauCeti"  # do_roadmap forks before launching; stub it
     tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
-    tc.work_units.prepare_checkout = lambda cfg: True
+    tc.work_units.prepare_checkout = lambda cfg, **kwargs: True
     tc.work_units.run_agent_host = lambda cwd, prompt, work_model, logdir: (captured.update(prompt=prompt), 0)[1]
     cfg = SimpleNamespace(
         state=Path("/tmp/tauceti-test/state"),
@@ -272,12 +270,13 @@ def test_random_default():
         wid="default",
     )
     w = SimpleNamespace(cfg=cfg, gh=object())
+    sv = SimpleNamespace(_mine_open_prs=[])
     opts = SimpleNamespace(agent_name="Claude Code", work_model="claude")
     try:
         # areas available → a random area is chosen and substituted into the prompt
         tc.work_units.roadmap_areas = lambda gh: ["algebra", "topology"]
         tc.random.choice = lambda seq: seq[-1]  # deterministic: the last remaining area
-        tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
+        tc.do_roadmap(w, sv, tc.Candidate(0, "", "auto"), opts, False)
         check("auto leaves no __ONLY__ placeholder", "__ONLY__" not in captured["prompt"])
         check("auto leaves no __SKIP__ placeholder", "__SKIP__" not in captured["prompt"])
         check("auto picked the area from the list", "`topology`" in captured["prompt"])
@@ -285,15 +284,19 @@ def test_random_default():
         # --roadmap-skip excludes an area from the random pick (so only "topology" remains)
         captured.clear()
         os.environ["TAUCETI_ROADMAP_SKIP"] = "algebra"
-        tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
+        tc.do_roadmap(w, sv, tc.Candidate(0, "", "auto"), opts, False)
         check("auto skips the excluded area", "`topology`" in captured["prompt"])
         check("skipped area named in the prompt", "algebra" in captured["prompt"])
         os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
-        # no areas (fetch failed) → fall back to all areas ("any")
+        # Without an area list, per-area capacity cannot be checked.
         captured.clear()
         tc.work_units.roadmap_areas = lambda gh: []
-        tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
-        check("auto falls back to all areas when the list is empty", "`any`" in captured["prompt"])
+        try:
+            tc.do_roadmap(w, sv, tc.Candidate(0, "", "auto"), opts, False)
+        except tc.NoProgress as exc:
+            check("empty area lookup does not bypass backpressure", "cannot check" in str(exc))
+        else:
+            check("empty area lookup does not bypass backpressure", False)
     finally:
         for k, v in orig.items():
             setattr(tc.work_units, k, v)
@@ -321,7 +324,7 @@ def test_skip_edge_cases():
     tc.work_units.fetch_ref = lambda *a, **k: True
     tc.work_units.ensure_fork = lambda: "alice/TauCeti"  # do_roadmap forks before launching; stub it
     tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
-    tc.work_units.prepare_checkout = lambda cfg: True
+    tc.work_units.prepare_checkout = lambda cfg, **kwargs: True
     tc.work_units.run_agent_host = lambda cwd, prompt, work_model, logdir: (captured.update(prompt=prompt), 0)[1]
     tc.work_units.roadmap_areas = lambda gh: ["algebra", "topology"]
     cfg = SimpleNamespace(

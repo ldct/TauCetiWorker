@@ -36,7 +36,7 @@ def me() -> str:
     (fix / fix-ci / rebase). Never hardcoded: whoever set up `gh auth` is who the worker acts as."""
     r = gh_run(["gh", "api", "user", "--jq", ".login"])  # waits out a rate limit rather than failing setup
     login = (r.stdout or "").strip()
-    if not login:
+    if r.returncode != 0 or not login:
         raise Die("could not determine the authenticated GitHub account (run `gh auth login`)")
     return login
 
