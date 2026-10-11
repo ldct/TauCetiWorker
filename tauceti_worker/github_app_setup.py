@@ -1,4 +1,4 @@
-"""One-time loopback-only GitHub App manifest setup. No secrets enter terminal/browser logs."""
+"""One-time GitHub App manifest setup behind loopback or an authenticated HTTPS proxy."""
 
 from __future__ import annotations
 
@@ -19,7 +19,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fork", required=True, help="your public fork, e.g. ldct/TauCeti")
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--public-origin", help="HTTPS origin of a trusted authenticated reverse proxy (no path)")
     args = parser.parse_args()
+    if args.public_origin:
+        parsed = urlsplit(args.public_origin)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            parser.error("--public-origin must be an HTTPS origin without credentials, path, query or fragment")
+        args.public_origin = f"https://{parsed.netloc}"
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", args.fork):
         parser.error("--fork must be owner/repository")
     ensure_ssl_cert_file()
@@ -28,13 +42,18 @@ def main() -> None:
         parser.error(f"already configured at {destination}; move it aside explicitly before creating another app")
     nonce = secrets.token_urlsafe(32)
     owner = args.fork.split("/")[0]
-    origin = f"http://127.0.0.1:{args.port}"
+    origin = args.public_origin or f"http://127.0.0.1:{args.port}"
+    expected_host = urlsplit(origin).netloc
     pending = destination.parent / "github-app-pending.json"
     key = destination.parent / "github-app.pem"
     if pending.exists():
         saved = json.loads(pending.read_text())
-        if saved.get("fork") != args.fork or saved.get("setup_port") != args.port:
-            parser.error("resume the pending App setup using the same --fork and --port")
+        if (
+            saved.get("fork") != args.fork
+            or saved.get("setup_port") != args.port
+            or saved.get("setup_origin", f"http://127.0.0.1:{args.port}") != origin
+        ):
+            parser.error("resume the pending App setup using the same --fork, --port and --public-origin")
         nonce = saved["setup_nonce"]
     manifest = {
         "name": f"{owner}-tauceti-reader",
@@ -72,7 +91,7 @@ def main() -> None:
             self.wfile.write(data)
 
         def do_GET(self):
-            if self.headers.get("Host") != f"127.0.0.1:{args.port}":
+            if self.headers.get("Host") != expected_host:
                 self.page("Host denied", 403)
                 return
             url = urlsplit(self.path)
@@ -111,6 +130,7 @@ def main() -> None:
                         "slug": reply["slug"],
                         "setup_nonce": nonce,
                         "setup_port": args.port,
+                        "setup_origin": origin,
                         "fork": args.fork,
                     }
                     private_write(pending, json.dumps(saved))

@@ -25,6 +25,21 @@ that public fork, and verifies it can read public upstream pull requests before
 enabling the configuration. No credentials are printed or committed. The local
 setup server exits on completion or after one hour.
 
+For a remote VM behind a **private, authenticated HTTPS reverse proxy**, run the
+helper from the source checkout with a fixed public origin, for example:
+
+```sh
+python -m tauceti_worker.github_app_setup --fork ldct/TauCeti \
+  --port 8766 --public-origin https://tauceti.exe.xyz:8766
+```
+
+The listener remains loopback-only. The proxy must reach that listener and preserve
+the public Host header. Callback URLs use the explicit origin; forwarded headers
+are not trusted. Host and random state checks remain mandatory. Keep the proxy
+private; never expose this credential-registration helper as a public service.
+Resume a pending setup with the same fork, port, and public origin. The helper
+prints a state-bearing setup link, but never private keys or installation tokens.
+
 GitHub permits installed Apps to read public repositories outside their installation:
 https://docs.github.com/en/apps/using-github-apps/installing-a-github-app-from-a-third-party
 
