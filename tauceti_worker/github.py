@@ -33,6 +33,8 @@ from .constants import (
     OPEN_PR_PAGE,
     TAUCETI,
 )
+from .github_identity import CACHE_ENV as IDENTITY_CACHE_ENV
+from .github_identity import cached_personal_login
 from .review_diagnostics import public_diagnostic_quality
 
 
@@ -250,10 +252,13 @@ def _pin_git_identity(login: str, user_id: int, *, configure_helper: bool) -> No
     os.environ["GIT_CONFIG_COUNT"] = str(count + len(settings))
 
 
-@functools.lru_cache(maxsize=1)
 def me() -> str:
-    """The GitHub login the worker is authenticated as (gh). Its PRs are the ones the worker tends
-    (fix / fix-ci / rebase). Never hardcoded: whoever set up `gh auth` is who the worker acts as."""
+    """The PERSONAL GitHub login whose PRs the worker tends (fix / fix-ci / rebase).
+
+    Never hardcoded: whoever set up `gh auth` is who the worker acts as. CLI workers share a
+    credential-keyed, expiring cache. Library callers keep the historical process-only cache
+    unless persistent caching is explicitly enabled.
+    """
     selected = os.environ.get("_TAUCETI_PINNED_GITHUB_ACCOUNT")
     if (
         selected
@@ -261,13 +266,31 @@ def me() -> str:
         and os.environ.get("_TAUCETI_PINNED_GITHUB_SCOPE") == transport.scope()
     ):
         return validate_github_account(selected)
-    r = gh_run(["gh", "api", "graphql", "-f", "query=query{viewer{login}}", "--jq", ".data.viewer.login"])
+    if os.environ.get(IDENTITY_CACHE_ENV) not in (None, "", "off"):
+        return cached_personal_login(_fetch_personal_login)
+    return _legacy_me()
+
+
+def _fetch_personal_login() -> str:
+    # Bypass the App shim: it may itself cache this exact query, and re-entering
+    # that cache while holding its process lock would deadlock. No App token here.
+    real = os.environ.get("TAUCETI_REAL_GH") or "gh"
+    r = gh_run([real, "api", "graphql", "-f", "query=query{viewer{login}}", "--jq", ".data.viewer.login"])
     login = (r.stdout or "").strip()
     if r.returncode != 0 and _gh_rate_kind((r.stderr or "") + (r.stdout or "")):
         raise Die("GitHub API rate limit exhausted while resolving identity; waiting for reset")
     if r.returncode != 0 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
         raise Die("could not determine the authenticated GitHub account (run `gh auth login`)")
     return login
+
+
+@functools.lru_cache(maxsize=1)
+def _legacy_me() -> str:
+    return _fetch_personal_login()
+
+
+# Historical tests/library callers explicitly clear the process-only identity.
+me.cache_clear = _legacy_me.cache_clear
 
 
 def can_push(repo: str) -> bool | None:
@@ -689,75 +712,66 @@ class GitHub:
                 transport.invalidate(args)
 
     def ignore_pr_notifications(self, pr: int) -> bool:
-        """Best-effort mute this authenticated user's notification thread for PR *pr*.
+        """Best-effort ignore this PR for the authenticated personal account after review.
 
-        GitHub notification subscriptions are per authenticated user and per notification-thread, not
-        per email address or PR number. Locate the PR's thread in this repository's complete
-        notification list, then set ``ignored=true`` on that thread. This deliberately does not retry
-        the PUT: it is a post-review convenience, never a reason to replay an already-posted review.
+        Resolve the public PR node ID (App-eligible), then mutate only the personal viewer's
+        subscription. No notification-history scan or existing notification thread is required.
+        The mutation runs ONCE, outside gh_run's transient/secondary retries: an ambiguous result
+        must never replay a write or invalidate an already-posted review.
         """
-        try:
-            listed = self._gh(["api", "--paginate", f"/repos/{self.repo}/notifications?all=true&per_page=50"])
-        except Exception:
-            log(f"  review #{pr}: disabling PR notifications FAILED unexpectedly; review remains successful")
-            return False
-        if listed.returncode != 0:
-            detail = _gh_diagnostic((listed.stderr or "") + "\n" + (listed.stdout or ""))
-            log(f"  review #{pr}: disabling PR notifications FAILED while finding its thread ({detail or 'no detail'})")
-            return False
-        try:
-            threads = json.loads(listed.stdout or "[]")
-        except json.JSONDecodeError:
-            log(f"  review #{pr}: disabling PR notifications FAILED (GitHub returned invalid notification JSON)")
-            return False
-        if not isinstance(threads, list):
-            log(f"  review #{pr}: disabling PR notifications FAILED (GitHub returned an invalid notification list)")
-            return False
 
-        # subject.url is host-specific on GitHub Enterprise, so match the stable REST path rather
-        # than assuming api.github.com. The repository-scoped listing above supplies the other half
-        # of the identity check.
-        suffix = f"/repos/{self.repo}/pulls/{pr}"
-        thread_ids = [
-            str(thread["id"])
-            for thread in threads
-            if isinstance(thread, dict)
-            and isinstance(thread.get("id"), (str, int))
-            and isinstance(thread.get("subject"), dict)
-            and thread["subject"].get("type") == "PullRequest"
-            and isinstance(thread["subject"].get("url"), str)
-            and thread["subject"]["url"].rstrip("/").endswith(suffix)
-        ]
-        if not thread_ids:
+        def failed(detail: str) -> bool:
             log(
-                f"  review #{pr}: no GitHub notification thread found to disable for the authenticated account; "
-                "review remains successful"
+                f"  review #{pr}: disabling PR notifications FAILED "
+                f"({_gh_diagnostic(detail) or 'no detail'}); review remains successful"
             )
             return False
 
-        ok = True
-        for thread_id in thread_ids:
-            try:
-                muted = self._gh(
-                    ["api", "-X", "PUT", f"/notifications/threads/{thread_id}/subscription", "-F", "ignored=true"]
-                )
-            except Exception:
-                log(
-                    f"  review #{pr}: disabling notification thread {thread_id} FAILED unexpectedly; "
-                    "review remains successful"
-                )
-                ok = False
-                continue
-            if muted.returncode != 0:
-                detail = _gh_diagnostic((muted.stderr or "") + "\n" + (muted.stdout or ""))
-                log(
-                    f"  review #{pr}: disabling notification thread {thread_id} FAILED "
-                    f"({detail or 'no detail'}); review remains successful"
-                )
-                ok = False
-                continue
-            log(f"  review #{pr}: disabled notifications for the authenticated account (thread {thread_id})")
-        return ok
+        try:
+            viewed = self._gh(["pr", "view", str(pr), "--repo", self.repo, "--json", "id"])
+        except Exception:
+            return failed("unexpected PR lookup failure")
+        if viewed.returncode != 0:
+            return failed("PR lookup: " + (viewed.stderr or "") + "\n" + (viewed.stdout or ""))
+        try:
+            node = json.loads(viewed.stdout or "null")
+            node_id = node.get("id") if isinstance(node, dict) else None
+            # IDs are opaque, but gh's field syntax must never interpret an @file value.
+            if (
+                not isinstance(node_id, str)
+                or not node_id
+                or node_id.startswith("@")
+                or any(c.isspace() for c in node_id)
+            ):
+                return failed("GitHub returned an invalid PR node ID")
+        except (ValueError, TypeError):
+            return failed("GitHub returned invalid PR JSON")
+
+        mutation = (
+            "mutation($id:ID!){updateSubscription(input:{subscribableId:$id,state:IGNORED})"
+            "{subscribable{id viewerSubscription}}}"
+        )
+        try:
+            muted = run(["gh", "api", "graphql", "-f", f"query={mutation}", "-f", f"id={node_id}"])
+        except Exception:
+            return failed("unexpected subscription mutation failure")
+        if muted.returncode != 0:
+            return failed("subscription mutation: " + (muted.stderr or "") + "\n" + (muted.stdout or ""))
+        try:
+            result = json.loads(muted.stdout or "null")
+            if not isinstance(result, dict) or ("errors" in result and result["errors"] != []):
+                return failed("GitHub returned subscription GraphQL errors or an invalid response")
+            subscription = result["data"]["updateSubscription"]["subscribable"]
+            if (
+                not isinstance(subscription, dict)
+                or subscription.get("id") != node_id
+                or subscription.get("viewerSubscription") != "IGNORED"
+            ):
+                return failed("GitHub did not confirm this PR's ignored subscription")
+        except (ValueError, TypeError, KeyError):
+            return failed("GitHub returned invalid subscription JSON or payload")
+        log(f"  review #{pr}: disabled notifications for the authenticated account")
+        return True
 
     def open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
         from .github_state import read

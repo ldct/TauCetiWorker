@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         assert os.environ["GIT_ALLOW_PROTOCOL"] == "https:file"
         assert os.environ["GIT_CONFIG_KEY_0"] == "test.operator"
         assert github.me() == "alice"
-        assert github.me.cache_info().currsize == 1
+        assert github.me() == "alice"  # the pinned identity is answered without another lookup
         count = os.environ["GIT_CONFIG_COUNT"]
 
         # The child uses the pinned token after HOME is moved; no named credential re-lookup.

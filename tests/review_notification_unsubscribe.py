@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Posted PR reviews best-effort mute the authenticated account's notification thread.
+"""Posted PR reviews ignore the personal subscription without listing notification history.
 
-No network is used: both the GitHub REST calls and review engine are mocked. The cases pin the
-thread lookup/API payload and make sure notification failures cannot turn an already-posted review
-into a failure or cause it to be replayed.
+No network is used: PR lookup, subscription mutation and review engine are mocked. Pin the
+public-read/personal-write boundary, validate GraphQL confirmation, and never replay a mutation
+or invalidate an already-posted review when notification muting fails.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -32,118 +33,154 @@ def cp(rc=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(["gh"], rc, stdout, stderr)
 
 
+NODE_ID = "PR_node42"
+LOOKUP = ["pr", "view", "42", "--repo", "TauCetiProject/TauCeti", "--json", "id"]
+MUTATION = (
+    "mutation($id:ID!){updateSubscription(input:{subscribableId:$id,state:IGNORED})"
+    "{subscribable{id viewerSubscription}}}"
+)
+MUTATE = ["gh", "api", "graphql", "-f", f"query={MUTATION}", "-f", f"id={NODE_ID}"]
+
+
+def confirmed(node_id=NODE_ID, state="IGNORED"):
+    return {"data": {"updateSubscription": {"subscribable": {"id": node_id, "viewerSubscription": state}}}}
+
+
 def test_notification_api():
     gh = tc.GitHub("TauCetiProject/TauCeti")
-    calls, logs = [], []
-    replies = iter(
-        [
-            cp(
-                stdout=json.dumps(
-                    [
-                        {
-                            "id": "other",
-                            "subject": {
-                                "type": "PullRequest",
-                                "url": "https://api.github.com/repos/TauCetiProject/TauCeti/pulls/7",
-                            },
-                        },
-                        {
-                            "id": "42",
-                            "subject": {
-                                "type": "PullRequest",
-                                "url": "https://ghe.example/api/v3/repos/TauCetiProject/TauCeti/pulls/42/",
-                            },
-                        },
-                        {
-                            "id": "wrong-kind",
-                            "subject": {
-                                "type": "Issue",
-                                "url": "https://api.github.com/repos/TauCetiProject/TauCeti/pulls/42",
-                            },
-                        },
-                    ]
-                )
-            ),
-            cp(),
-        ]
-    )
-    gh._gh = lambda args: calls.append(args) or next(replies)
-    old_log = tc.github.log
-    tc.github.log = logs.append
-    try:
-        check("matching PR notification is muted", gh.ignore_pr_notifications(42))
-        check(
-            "lists all repository notification threads",
-            calls[0],
-            ["api", "--paginate", "/repos/TauCetiProject/TauCeti/notifications?all=true&per_page=50"],
-        )
-        check(
-            "sets GitHub ignored subscription field",
-            calls[1],
-            ["api", "-X", "PUT", "/notifications/threads/42/subscription", "-F", "ignored=true"],
-        )
-        check("successful mute is logged", "disabled notifications" in logs[-1])
-    finally:
-        tc.github.log = old_log
+    with (
+        patch.object(gh, "_gh", return_value=cp(stdout=json.dumps({"id": NODE_ID}))) as lookup,
+        patch.object(tc.github, "run", return_value=cp(stdout=json.dumps(confirmed()))) as mutate,
+        patch.object(tc.github, "log") as log,
+    ):
+        check("matching PR subscription is muted", gh.ignore_pr_notifications(42))
+        check("public lookup uses explicit repo and only PR node ID", lookup.call_args.args[0], LOOKUP)
+        check("lookup happens once", lookup.call_count, 1)
+        check("mutation sets personal subscription IGNORED", mutate.call_args.args[0], MUTATE)
+        check("mutation is executed exactly once", mutate.call_count, 1)
+        check("successful mute is logged", "disabled notifications" in log.call_args.args[0])
 
-    gh = tc.GitHub("TauCetiProject/TauCeti")
-    calls, logs = [], []
-    gh._gh = lambda args: calls.append(args) or cp(stdout="[]")
-    old_log = tc.github.log
-    tc.github.log = logs.append
-    try:
-        check("no notification is a no-op", gh.ignore_pr_notifications(42), False)
-        check("no notification makes no PUT", len(calls), 1)
-        check("no notification is clear in logs", "no GitHub notification thread" in logs[-1])
-    finally:
-        tc.github.log = old_log
+    from tauceti_worker.github_app import public_read
 
+    with patch.dict(os.environ, {"GH_HOST": "github.com"}):
+        check("PR ID lookup is App eligible", public_read(LOOKUP, [gh.repo]))
+        check("subscription mutation must stay personal", public_read(MUTATE[1:], [gh.repo]), False)
+    check("subscription mutation is not retryable as a read", tc.github._gh_read_only(MUTATE), False)
+    check("notification history endpoint is absent", "notifications" in " ".join(LOOKUP + MUTATE), False)
+
+
+def test_lookup_failures():
     gh = tc.GitHub("TauCetiProject/TauCeti")
-    calls, logs = [], []
-    replies = iter(
-        [
-            cp(
-                stdout=json.dumps(
-                    [
-                        {
-                            "id": "42",
-                            "subject": {
-                                "type": "PullRequest",
-                                "url": "https://api.github.com/repos/TauCetiProject/TauCeti/pulls/42",
-                            },
-                        }
-                    ]
-                )
-            ),
-            cp(1, stderr="HTTP 403 forbidden"),
-        ]
-    )
-    gh._gh = lambda args: calls.append(args) or next(replies)
-    old_log = tc.github.log
-    tc.github.log = logs.append
-    try:
-        check("subscription API failure is reported", gh.ignore_pr_notifications(42), False)
-        check("subscription API failure is non-throwing", "FAILED" in logs[-1])
-    finally:
-        tc.github.log = old_log
+    cases = [
+        ("lookup HTTP failure", cp(1, stderr="HTTP 404")),
+        ("invalid JSON", cp(stdout="not json")),
+        ("empty output", cp()),
+        ("null response", cp(stdout="null")),
+        ("list response", cp(stdout="[]")),
+        ("missing ID", cp(stdout="{}")),
+        ("null ID", cp(stdout='{"id":null}')),
+        ("numeric ID", cp(stdout='{"id":42}')),
+        ("empty ID", cp(stdout='{"id":""}')),
+        ("whitespace ID", cp(stdout='{"id":" PR_node42"}')),
+        ("file expansion ID", cp(stdout='{"id":"@/private/file"}')),
+    ]
+    for name, response in cases:
+        with (
+            patch.object(gh, "_gh", return_value=response),
+            patch.object(tc.github, "run") as mutate,
+            patch.object(tc.github, "log") as log,
+        ):
+            check(f"{name} fails best-effort", gh.ignore_pr_notifications(42), False)
+            check(f"{name} never mutates", mutate.call_count, 0)
+            check(f"{name} preserves posted review", "review remains successful" in log.call_args.args[0])
+    with (
+        patch.object(gh, "_gh", side_effect=OSError("unexpected")),
+        patch.object(tc.github, "run") as mutate,
+        patch.object(tc.github, "log"),
+    ):
+        check("lookup exception fails best-effort", gh.ignore_pr_notifications(42), False)
+        check("lookup exception never mutates", mutate.call_count, 0)
+
+
+def test_mutation_responses():
+    gh = tc.GitHub("TauCetiProject/TauCeti")
+    partial = {**confirmed(), "errors": [{"message": "partial failure"}]}
+    cases = [
+        ("empty output", ""),
+        ("malformed JSON", "not json"),
+        ("null response", "null"),
+        ("list response", "[]"),
+        ("missing data", "{}"),
+        ("null data", '{"data":null}'),
+        ("invalid data", '{"data":[]}'),
+        ("missing mutation", '{"data":{}}'),
+        ("null mutation", '{"data":{"updateSubscription":null}}'),
+        ("missing subscribable", '{"data":{"updateSubscription":{}}}'),
+        ("null subscribable", '{"data":{"updateSubscription":{"subscribable":null}}}'),
+        ("missing subscription fields", '{"data":{"updateSubscription":{"subscribable":{}}}}'),
+        ("mismatched node ID", json.dumps(confirmed("PR_other"))),
+        ("not ignored", json.dumps(confirmed(state="UNSUBSCRIBED"))),
+        ("subscribed", json.dumps(confirmed(state="SUBSCRIBED"))),
+        ("missing viewer subscription", json.dumps(confirmed(state=None))),
+        ("GraphQL errors", json.dumps({"errors": [{"message": "denied"}]})),
+        ("partial success with errors", json.dumps(partial)),
+        ("malformed errors", json.dumps({**confirmed(), "errors": {}})),
+    ]
+    for name, stdout in cases:
+        with (
+            patch.object(gh, "_gh", return_value=cp(stdout=json.dumps({"id": NODE_ID}))),
+            patch.object(tc.github, "run", return_value=cp(stdout=stdout)) as mutate,
+            patch.object(tc.github, "log") as log,
+        ):
+            check(f"mutation {name} is not success", gh.ignore_pr_notifications(42), False)
+            check(f"mutation {name} is never replayed", mutate.call_count, 1)
+            check(f"mutation {name} logs best-effort failure", "review remains successful" in log.call_args.args[0])
+
+    with (
+        patch.object(gh, "_gh", return_value=cp(stdout=json.dumps({"id": NODE_ID}))),
+        patch.object(tc.github, "run", side_effect=OSError("unexpected")) as mutate,
+        patch.object(tc.github, "log"),
+    ):
+        check("mutation exception fails best-effort", gh.ignore_pr_notifications(42), False)
+        check("mutation exception is never replayed", mutate.call_count, 1)
 
 
 def test_mute_not_retried_on_transient():
-    # Upstream added retries to gh_run. Reads may retry, but never replay an ambiguous PUT.
     gh = tc.GitHub("TauCetiProject/TauCeti")
-    thread = {
-        "id": "42",
-        "subject": {"type": "PullRequest", "url": "https://api.github.com/repos/TauCetiProject/TauCeti/pulls/42"},
-    }
-    with (
-        patch.object(tc.github, "run", side_effect=[cp(stdout=json.dumps([thread])), cp(1, stderr="HTTP 504")]) as run,
-        patch.object(tc.github.time, "sleep") as sleep,
-        patch.object(tc.github, "log"),
+    # Exercise the actual _gh -> gh_run read path, then verify the mutation bypasses gh_run even
+    # for secondary rate limits (gh_run otherwise retries writes on explicit rate rejection).
+    for error in (
+        "HTTP 504",
+        "HTTP 403 secondary rate limit Retry-After: 1",
+        "HTTP 403 API rate limit exceeded",
+        "HTTP 429",
     ):
-        check("transient notification PUT failure stays best-effort", gh.ignore_pr_notifications(42), False)
-        check("ambiguous notification PUT is not replayed", run.call_count, 2)
-        check("ambiguous notification PUT never sleeps to retry", sleep.call_count, 0)
-        check("PUT still sends ignored as a boolean", run.call_args.args[0][-2:], ["-F", "ignored=true"])
+        with (
+            patch.object(
+                tc.github, "run", side_effect=[cp(stdout=json.dumps({"id": NODE_ID})), cp(1, stderr=error)]
+            ) as run,
+            patch.object(tc.github.time, "sleep") as sleep,
+            patch.object(tc.github, "log"),
+        ):
+            check(f"{error} mutation stays best-effort", gh.ignore_pr_notifications(42), False)
+            check(f"{error} makes one read and one mutation", run.call_count, 2)
+            check(f"{error} never sleeps to retry", sleep.call_count, 0)
+            check(f"{error} uses the exact mutation argv", run.call_args.args[0], MUTATE)
+
+
+def test_failure_diagnostics():
+    gh = tc.GitHub("TauCetiProject/TauCeti")
+    secret = "private-test-token"
+    with (
+        patch.dict(os.environ, {"GH_TOKEN": secret}),
+        patch.object(gh, "_gh", return_value=cp(stdout=json.dumps({"id": NODE_ID}))),
+        patch.object(tc.github, "run", return_value=cp(1, stderr=f"HTTP 403 {secret} " + "x" * 5000)),
+        patch.object(tc.github, "log") as log,
+    ):
+        check("diagnostic failure is nonfatal", gh.ignore_pr_notifications(42), False)
+        message = log.call_args.args[0]
+        check("diagnostic redacts credentials", secret in message, False)
+        check("diagnostic is bounded", len(message) < 2200)
 
 
 class Counters:
@@ -242,7 +279,10 @@ def test_review_lifecycle():
 
 
 test_notification_api()
+test_lookup_failures()
+test_mutation_responses()
 test_mute_not_retried_on_transient()
+test_failure_diagnostics()
 test_review_lifecycle()
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

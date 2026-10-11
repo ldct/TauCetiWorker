@@ -86,6 +86,7 @@ from .cost_model import format_report as format_cost_report
 from .github import GitHub, pin_github_account, shared_claims_granted
 from .github_app import AppError
 from .github_app import enable as enable_github_app
+from .github_identity import enable_identity_cache
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
 from .quota import (
@@ -1816,6 +1817,7 @@ def cli_main() -> int:
         return EX_GITHUB_WAIT
 
     try:
+        enable_identity_cache()  # real HOME, before isolation; also works when App auth is off
         enable_github_app()
         return main() or 0
     except GitHubUnavailable as e:
