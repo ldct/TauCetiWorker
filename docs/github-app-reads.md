@@ -63,9 +63,46 @@ directory is 0700. App errors do not fall back to personal authentication. Revok
 the installation or App key in GitHub to revoke its access.
 
 Only approved REST endpoint patterns and explicit public `pr`/`issue` reads route
-to the App. Two exact built-in GraphQL survey/progress queries also qualify; all
-other GraphQL documents keep personal authentication. Unsupported CLI flag forms
-conservatively keep personal authentication. Writes never use the App token.
+to the App. This includes public git refs/trees/blobs/commits and Actions job
+metadata, supported inline/attached CLI flags, explicit `--hostname github.com`,
+allowlisted representation/version headers, and audited query fields when the
+method is explicitly GET. Fields without explicit GET remain personal because
+`gh api` otherwise defaults to POST. Repository-root permission lookups and
+notification endpoints remain personal.
+
+The exact built-in survey/progress queries and TauCetiReview's public thread-ID
+lookup also qualify. Arbitrary GraphQL, mutations, unsafe headers, unknown
+repositories, implicit repository selection, and unsupported syntax retain
+personal authentication. No installation permissions are broadened. Add another
+repository to `public_repositories` only after verifying it is public; to offload
+review rubric refs/trees, include `TauCetiProject/TauCetiReview`.
+
+## Personal identity cache
+
+CLI startup anchors `TAUCETI_GITHUB_IDENTITY_CACHE` to an absolute path before
+worker HOME isolation (default `~/.cache/tauceti/github-identity/login.json`).
+The shared, locked cache lasts 15 minutes and is keyed by a SHA-256 fingerprint of
+the current personal credential and GitHub host. Credential rotation or account
+switching invalidates it; a revoked token is not made usable for writes. Tokens
+and profile responses are never persisted: only the fingerprint, public login,
+and timestamp. Directory mode is 0700, files 0600; unsafe cache paths are refused.
+
+The Worker and exact `gh api user --jq .login` / `gh api /user --jq .login`
+queries through its shim reuse this cache. Misses always use the real CLI with
+personal authentication. Failures and malformed identities are never cached;
+cache failure falls back to the personal lookup. Non-github.com hosts bypass this
+cache. Set the variable to `off` to disable persistent caching. Enabling it does
+not inject GitHub credentials into the review engine's tokenless model environment.
+
+## Constant-cost post-review notification muting
+
+After a successful review, the Worker obtains the public PR node ID and makes
+one personal GraphQL `updateSubscription` mutation with state `IGNORED`. This
+replaces the former unbounded, paginated traversal of the user's entire repository
+notification history. The read is App-eligible; the mutation always stays personal,
+is not automatically retried, and must explicitly confirm the same PR's ignored
+subscription. Muting remains best-effort: failure never invalidates an already
+posted review or skips archive processing.
 
 The loop's personal-budget preflight remains enabled: it still needs personal
 quota for contributions and non-routed calls. An exhausted personal budget must

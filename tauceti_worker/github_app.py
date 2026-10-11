@@ -165,11 +165,141 @@ _REST = re.compile(
     r"|issues(?:/\d+(?:/(?:comments|events|timeline|labels|reactions))?|/comments/\d+(?:/reactions)?)?"
     r"|commits(?:/[\w.-]+(?:/(?:status|statuses|check-runs|check-suites|comments|pulls))?)?"
     r"|compare/[\w.%-]+|contents(?:/[\w./-]+)?|labels|tags|branches(?:/[\w.-]+)?"
-    r"|actions/runs(?:/\d+(?:/jobs)?)?|check-runs/\d+|check-suites/\d+(?:/check-runs)?)"
+    r"|actions/runs(?:/\d+(?:/jobs)?)?|actions/jobs/\d+|check-runs/\d+|check-suites/\d+(?:/check-runs)?"
+    r"|git/(?:ref|refs|matching-refs)/[\w./-]+|git/(?:trees|blobs|commits)/[\w.-]+)"
 )
 _JSON_FIELDS = frozenset(
     "number title body state isDraft author labels comments reviews files commits headRefOid headRefName headRepository headRepositoryOwner baseRefName baseRefOid url createdAt updatedAt closedAt mergedAt mergeable mergeStateStatus statusCheckRollup additions deletions changedFiles reviewDecision milestone assignees id".split()
 )
+
+
+# TauCetiReview runner/post.py's public thread lookup. Keep the document exact:
+# the following resolveReviewThread mutation must remain personal.
+_REVIEW_THREADS_QUERY = (
+    "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
+    "pullRequest(number:$pr){reviewThreads(first:100){nodes{id isResolved "
+    "comments(first:1){nodes{databaseId}}}}}}}"
+)
+_API_VALUES = frozenset(
+    (
+        "--jq",
+        "-q",
+        "--template",
+        "-t",
+        "--method",
+        "-X",
+        "-f",
+        "-F",
+        "--raw-field",
+        "--field",
+        "--hostname",
+        "--header",
+        "-H",
+    )
+)
+_GET_FIELDS = frozenset(("per_page", "page", "state", "since", "sort", "direction", "base", "head"))
+_SAFE_ACCEPT = frozenset(
+    (
+        "application/vnd.github+json",
+        "application/vnd.github.v3+json",
+        "application/vnd.github.raw+json",
+        "application/vnd.github.v3.raw",
+        "application/vnd.github.diff",
+    )
+)
+
+
+def _expand_options(args: list[str], valued: frozenset[str]) -> list[str]:
+    """Normalize only known value-taking options; unknown grammar stays rejected."""
+    out = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in valued:
+            out.append(arg)
+            i += 1
+            if i < len(args):
+                out.append(args[i])
+        elif arg.startswith("--") and "=" in arg and arg.split("=", 1)[0] in valued:
+            out.extend(arg.split("=", 1))
+        elif len(arg) > 2 and arg[:2] in valued and not arg.startswith("--"):
+            out.extend((arg[:2], arg[2:]))
+        else:
+            out.append(arg)
+        i += 1
+    return out
+
+
+def _api_public_read(args: list[str], allowed: set[str]) -> bool:
+    args = _expand_options(args, _API_VALUES)
+    endpoint = None
+    fields = {}
+    method = None
+    host_seen = False
+    headers_seen = set()
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--paginate", "--slurp", "--silent", "--include", "-i"):
+            i += 1
+            continue
+        if arg in _API_VALUES:
+            if i + 1 == len(args):
+                return False
+            value = args[i + 1]
+            if arg in ("--method", "-X"):
+                if method is not None or value != "GET":
+                    return False
+                method = value
+            elif arg == "--hostname":
+                if host_seen or value != "github.com":
+                    return False
+                host_seen = True
+            elif arg in ("--header", "-H"):
+                name, sep, val = value.partition(":")
+                name, val = name.strip().lower(), val.strip()
+                if not sep or name in headers_seen or "\n" in value or "\r" in value:
+                    return False
+                headers_seen.add(name)
+                if not (
+                    name == "accept" and val in _SAFE_ACCEPT or name == "x-github-api-version" and val == "2022-11-28"
+                ):
+                    return False
+            elif arg in ("-f", "-F", "--raw-field", "--field"):
+                key, sep, val = value.partition("=")
+                if not sep or key in fields or val.startswith("@"):
+                    return False
+                fields[key] = val
+            i += 2
+            continue
+        if arg.startswith("-") or endpoint is not None:
+            return False
+        endpoint = arg
+        i += 1
+    if endpoint == "graphql":
+        from .github import _OPEN_PRS_QUERY, _PR_PROGRESS_QUERY
+
+        query = fields.get("query")
+        name = fields.get("repo") if query == _OPEN_PRS_QUERY else fields.get("name")
+        return (
+            query in (_OPEN_PRS_QUERY, _PR_PROGRESS_QUERY, _REVIEW_THREADS_QUERY)
+            and set(fields) <= {"query", "owner", "repo", "name", "n", "cursor", "pr"}
+            and f"{fields.get('owner')}/{name}".lower() in allowed
+        )
+    if not endpoint:
+        return False
+    # gh defaults to POST when any field is present. Only explicit GET permits
+    # safe query fields; never classify an implicit write as an App read.
+    if fields and (method != "GET" or not set(fields) <= _GET_FIELDS):
+        return False
+    match = re.fullmatch(r"/?repos/([\w.-]+/[\w.-]+)/([^?#]+)(?:\?[^#]*)?", endpoint)
+    return bool(
+        match
+        and match[1].lower() in allowed
+        and _REST.fullmatch(match[2])
+        and ".." not in match[2].split("/")
+        and "%" not in match[2]
+    )
 
 
 def public_read(args: list[str], repos: list[str]) -> bool:
@@ -178,49 +308,34 @@ def public_read(args: list[str], repos: list[str]) -> bool:
         return False
     allowed = {r.lower() for r in repos}
     if args[0] == "api":
-        endpoint = None
-        fields = {}
-        i = 1
-        while i < len(args):
-            arg = args[i]
-            if arg in ("--paginate", "--slurp", "--silent", "--include", "-i"):
-                i += 1
-                continue
-            if arg in ("--jq", "-q", "--template", "-t", "--method", "-X", "-f", "-F", "--raw-field", "--field"):
-                if i + 1 == len(args):
-                    return False
-                value = args[i + 1]
-                if arg in ("--method", "-X") and value != "GET":
-                    return False
-                if arg in ("-f", "-F", "--raw-field", "--field"):
-                    key, sep, val = value.partition("=")
-                    if not sep or key in fields or val.startswith("@"):
-                        return False
-                    fields[key] = val
-                i += 2
-                continue
-            if arg.startswith("-") or endpoint is not None:
-                return False
-            endpoint = arg
-            i += 1
-        if endpoint == "graphql":
-            # Only the two built-in, reviewed documents, compared verbatim. No heuristic
-            # 'not mutation' test that could accidentally switch viewer/account identity.
-            from .github import _OPEN_PRS_QUERY, _PR_PROGRESS_QUERY
-
-            query = fields.get("query")
-            name = fields.get("repo") if query == _OPEN_PRS_QUERY else fields.get("name")
-            return (
-                query in (_OPEN_PRS_QUERY, _PR_PROGRESS_QUERY)
-                and set(fields) <= {"query", "owner", "repo", "name", "n", "cursor", "pr"}
-                and f"{fields.get('owner')}/{name}".lower() in allowed
+        return _api_public_read(args, allowed)
+    args = _expand_options(
+        args,
+        frozenset(
+            (
+                "--repo",
+                "-R",
+                "--json",
+                "--jq",
+                "-q",
+                "--template",
+                "-t",
+                "--state",
+                "--limit",
+                "-L",
+                "--label",
+                "-l",
+                "--author",
+                "-A",
+                "--search",
+                "-S",
+                "--base",
+                "-B",
+                "--head",
+                "-H",
             )
-        if fields or not endpoint:
-            return False
-        match = re.fullmatch(r"/?repos/([\w.-]+/[\w.-]+)/([^?#]+)(?:\?[^#]*)?", endpoint)
-        return bool(
-            match and match[1].lower() in allowed and _REST.fullmatch(match[2]) and ".." not in match[2].split("/")
-        )
+        ),
+    )
     if len(args) < 2 or args[0] not in ("pr", "issue") or args[1] not in ("list", "view", "diff", "checks"):
         return False
     if args[0] == "issue" and args[1] not in ("list", "view"):
@@ -308,12 +423,31 @@ def gh_main() -> None:
         path = config_path()
         conf = read_config(path)
         env = os.environ.copy()
+        env.pop("GH_DEBUG", None)
+        real = os.environ["TAUCETI_REAL_GH"]
+        # Reuse the shared PERSONAL identity cache for trusted review/progress
+        # subprocesses too. Never cache arbitrary /user fields or use App auth.
+        if args in (["api", "user", "--jq", ".login"], ["api", "/user", "--jq", ".login"]):
+            from .github_identity import cached_personal_login
+
+            def fetch_login() -> str:
+                result = subprocess.run([real, *args], env=env, text=True, capture_output=True, check=True)
+                return result.stdout.strip()
+
+            try:
+                print(cached_personal_login(fetch_login))
+                return
+            except subprocess.CalledProcessError as exc:
+                # Preserve real-gh diagnostics, notably primary/secondary limits,
+                # so the Worker's retry policy and scheduler can recognize them.
+                sys.stdout.write(exc.stdout or "")
+                sys.stderr.write(exc.stderr or "")
+                raise SystemExit(exc.returncode if exc.returncode > 0 else 128 - exc.returncode) from None
         if public_read(args, conf["public_repositories"]):
             env["GH_TOKEN"] = installation_token(path)
             env.pop("GITHUB_TOKEN", None)
             # Don't allow HTTP-debug logging to print an App token or response headers.
             env.pop("GH_DEBUG", None)
-        real = os.environ["TAUCETI_REAL_GH"]
         os.execve(real, [real, *args], env)
     except (AppError, OSError, KeyError) as exc:
         message = str(exc) if isinstance(exc, AppError) else "could not launch gh"

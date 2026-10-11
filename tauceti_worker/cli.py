@@ -69,6 +69,7 @@ from .constants import (
 from .github import GitHub, shared_claims_granted
 from .github_app import AppError
 from .github_app import enable as enable_github_app
+from .github_identity import enable_identity_cache
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
 from .quota import (
@@ -1176,6 +1177,7 @@ def cli_main() -> int:
         log("no system CA bundle found; set SSL_CERT_FILE if TLS verification fails")
     _ensure_scripts_executable()
     try:
+        enable_identity_cache()  # real HOME, before isolation; also works when App auth is off
         enable_github_app()
         return main() or 0
     except AppError as e:
