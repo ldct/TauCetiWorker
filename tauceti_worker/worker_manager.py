@@ -1899,7 +1899,15 @@ def cmd_workers(args) -> int:
                     if args.anthropic_api_key_file
                     else None,
                 }
-                for key in ("github_account", "roadmap_only", "source", "author_model", "author_effort", "pace", "quota_reserve"):
+                for key in (
+                    "github_account",
+                    "roadmap_only",
+                    "source",
+                    "author_model",
+                    "author_effort",
+                    "pace",
+                    "quota_reserve",
+                ):
                     value = getattr(args, key, None)
                     if value is not None:
                         raw[key] = value
