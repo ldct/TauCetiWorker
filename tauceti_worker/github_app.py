@@ -279,10 +279,11 @@ def _api_public_read(args: list[str], allowed: set[str]) -> bool:
     if endpoint == "graphql":
         from .github import _OPEN_PRS_QUERY, _PR_PROGRESS_QUERY
         from .github_comments import COMMENTS_QUERIES
+        from .github_review_comments import REVIEW_QUERIES, REVIEW_THREAD_QUERY
 
         query = fields.get("query")
         # Exact trusted documents only: variables cannot introduce fields or mutations.
-        for size, document in COMMENTS_QUERIES.items():
+        for size, document in (*COMMENTS_QUERIES.items(), *REVIEW_QUERIES.items()):
             if query == document:
                 required = {"query", "owner", "name"} | {f"pr{i}" for i in range(size)}
                 optional = {f"cursor{i}" for i in range(size)}
@@ -291,6 +292,14 @@ def _api_public_read(args: list[str], allowed: set[str]) -> bool:
                     and all(re.fullmatch(r"[1-9][0-9]*", fields[f"pr{i}"]) for i in range(size))
                     and f"{fields.get('owner')}/{fields.get('name')}".lower() in allowed
                 )
+        if query == REVIEW_THREAD_QUERY:
+            required = {"query", "owner", "name", "pr0", "commentCursor"}
+            return (
+                required <= set(fields) <= required | {"threadCursor"}
+                and re.fullmatch(r"[1-9][0-9]*", fields["pr0"]) is not None
+                and bool(fields["commentCursor"])
+                and f"{fields.get('owner')}/{fields.get('name')}".lower() in allowed
+            )
         name = fields.get("repo") if query == _OPEN_PRS_QUERY else fields.get("name")
         return (
             query in (_OPEN_PRS_QUERY, _PR_PROGRESS_QUERY, _REVIEW_THREADS_QUERY)

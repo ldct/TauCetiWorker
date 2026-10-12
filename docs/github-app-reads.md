@@ -83,8 +83,8 @@ Deep surveys prefetch only build-green, non-draft PRs whose scoreboard/marker
 cache cannot answer at the observed `updatedAt`. Discussion (issue) comments are
 read in batches of at most ten PRs before the existing parallel review checks.
 Forty cold PRs with at most 100 comments each therefore require four comment
-requests; unchanged cached PRs require none. Inline review/contest comments and
-all write paths are unchanged.
+requests; unchanged cached PRs require none. Inline review/contest comments use the separate batching path below; all write
+paths are unchanged.
 
 The App router recognizes exactly ten built-in query documents (sizes 1–10),
 with an explicitly allowed repository and PR numbers/cursors passed as variables.
@@ -100,6 +100,51 @@ cleared after the pool joins (including on errors). Forced dispatch reads always
 bypass them. This adds no shared/cross-worker cache or review-pool policy changes.
 Library/test GitHub adapters without a batch method retain the original per-PR
 read path. Validation is offline: `uv run python tests/github_comments_batch.py`.
+
+## Survey inline review-comment / contest batching
+
+Within that same review-phase scope, inline comments are prefetched only for PRs
+whose scoreboard says the current head was cleanly reviewed and whose contest
+sidecar is not entitled to answer. Selection reads the discussion snapshot/cache
+without pre-writing scoreboards or contest sidecars. Forty cold already-reviewed
+PRs with small thread histories require four inline root requests (in addition to
+four cold discussion requests), not forty REST requests. Warm unchanged contests
+need no inline requests. Author-phase reads and forced dispatch reads retain their
+existing behavior; force, bust, observe, and scope exit discard inline snapshots.
+
+Ten exact root documents batch 1–10 PRs with `reviewThreads(first:20)` and nested
+`comments(first:20)`. Both connections are fully paginated. Each longer thread
+uses one exact continuation document: repository → PR →
+`reviewThreads(first:1,after:$threadCursor)` → `comments(first:100,after:$commentCursor)`.
+The thread cursor is its predecessor edge cursor (omitted for the first thread).
+Every continuation verifies PR number, thread ID, edge cursor and total counts.
+There are no global `node(id:)` reads: even arbitrary cursor variables remain
+bound to the allowlisted repository and PR. The App router requires the exact
+document and allowed repository variables, rejecting extra fields/IDs.
+Root requests select under 10,000 nodes even counting reply objects, below the
+500,000-node limit; continuations are smaller.
+
+The adapter uses `fullDatabaseId` (BigInt), converting decimal strings directly
+to Python integers without float rounding. It returns the existing REST-shaped
+`id`, `body`, `in_reply_to_id`, and `created_at` fields. GraphQL's `replyTo` is a
+parent relationship, whereas REST's reply endpoint only accepts top-level review
+comments. Complete per-thread ancestry is therefore resolved to the unique root
+before contest detection; the highest integer comment ID still wins, not a string
+comparison or timestamp. Missing parents, cycles, duplicate/malformed IDs, null
+nodes, inconsistent counts, and GraphQL errors discard the whole affected PR,
+while healthy aliases survive. A failed fetch never writes a false no-contest
+sidecar and never silently retries REST inside the review snapshot. Each connection
+has a 100-page cap; reaching it means failure, not truncated success.
+
+Schema/parent-semantics references (documentation only; no production API calls):
+- https://docs.github.com/en/graphql/reference/objects#pullrequestreviewcomment
+- https://docs.github.com/en/rest/pulls/comments#create-a-reply-for-a-review-comment
+
+Offline coverage: `uv run python tests/github_review_comments_batch.py` includes
+40-PR surveys, >100 threads and replies, IDs beyond 2^31 and 2^53, parent-chain
+normalization, pagination failures, exact routing, cache selection, force/bust,
+and review/author phase boundaries. No deployment or live API comparison is part
+of these tests.
 
 ## Personal identity cache
 

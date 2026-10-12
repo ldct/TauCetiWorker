@@ -61,6 +61,8 @@ def fields(args):
 class FakeGitHub(tc.GitHub):
     """Real batch method, with a transport that refuses anything except trusted reads."""
 
+    review_comments_batch = None  # legacy inline adapter: this suite isolates discussion batching
+
     def __init__(self, count=40):
         super().__init__()
         self.count = count

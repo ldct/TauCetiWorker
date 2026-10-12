@@ -752,10 +752,12 @@ def survey(
     results = {}
     if progress:
         progress(f"Checking PR reviews: 0/{len(review_prs)}")
-    # Finish bounded issue-comment prefetch before starting any per-PR readers. Its
-    # scoped results outlive the short memo, but never escape this read-only phase.
+    # Finish discussion prefetch, then inline prefetch for reviewed-at-head PRs,
+    # before starting per-PR readers. Snapshots never escape this review phase.
     with (
-        rs.survey_comments([p.number for p in review_prs]) if deep else nullcontext(),
+        rs.survey_comments([p.number for p in review_prs], heads={p.number: p.head_oid for p in review_prs})
+        if deep
+        else nullcontext(),
         ThreadPoolExecutor(max_workers=SURVEY_WORKERS, thread_name_prefix="survey") as pool,
     ):
         pending = {pool.submit(_survey_review, p, cfg, gh, rs, counters, deep): p.number for p in review_prs}
