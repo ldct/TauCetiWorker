@@ -112,8 +112,9 @@ four cold discussion requests), not forty REST requests. Warm unchanged contests
 need no inline requests. Author-phase reads and forced dispatch reads retain their
 existing behavior; force, bust, observe, and scope exit discard inline snapshots.
 
-Ten exact root documents batch 1–10 PRs with `reviewThreads(first:20)` and nested
-`comments(first:20)`. Both connections are fully paginated. Each longer thread
+Ten exact root documents batch 1–10 PRs with `reviewThreads(first:10)` and nested
+`comments(first:100)`. This avoids extra per-thread HTTP requests for ordinary
+threads with up to 100 comments while keeping the root request bounded. Both connections are fully paginated. Each longer thread
 uses one exact continuation document: repository → PR →
 `reviewThreads(first:1,after:$threadCursor)` → `comments(first:100,after:$commentCursor)`.
 The thread cursor is its predecessor edge cursor (omitted for the first thread).
@@ -121,8 +122,9 @@ Every continuation verifies PR number, thread ID, edge cursor and total counts.
 There are no global `node(id:)` reads: even arbitrary cursor variables remain
 bound to the allowlisted repository and PR. The App router requires the exact
 document and allowed repository variables, rejecting extra fields/IDs.
-Root requests select under 10,000 nodes even counting reply objects, below the
-500,000-node limit; continuations are smaller.
+Root requests select roughly 20,000 nodes including reply objects, below the
+500,000-node limit; continuations are smaller. Request-count savings do not imply
+a measured latency improvement; survey timing still needs a live comparison.
 
 The adapter uses `fullDatabaseId` (BigInt), converting decimal strings directly
 to Python integers without float rounding. It returns the existing REST-shaped

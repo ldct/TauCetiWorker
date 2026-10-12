@@ -68,7 +68,7 @@ class InlineGitHub(FakeGitHub):
                     {
                         "id": f"thread-{pr}-{n}",
                         "comments": connection(
-                            comments, offset=int(variables.get("commentCursor", "0")), limit=100 if continuation else 20
+                            comments, offset=int(variables.get("commentCursor", "0")), limit=batch.REVIEW_COMMENTS_PAGE
                         ),
                     }
                 )
@@ -77,7 +77,7 @@ class InlineGitHub(FakeGitHub):
                 "reviewThreads": connection(
                     threads,
                     offset=int(variables.get("threadCursor" if continuation else f"cursor{i}", "0")),
-                    limit=1 if continuation else 20,
+                    limit=1 if continuation else batch.REVIEW_THREADS_PAGE,
                     edges=True,
                 ),
             }
@@ -103,27 +103,38 @@ class InlineBatchTests(unittest.TestCase):
             self.assertEqual(fields(self.gh.inline_requests[-1])["query"], batch.REVIEW_QUERIES[size])
         self.assertEqual(self.gh.review, [])
 
+    def test_forty_full_first_comment_pages_need_no_thread_requests(self):
+        self.gh.threads = {
+            pr: [[comment(1)] + [comment(i, "CONTEST", 1) for i in range(2, 101)]] for pr in range(1, 41)
+        }
+        result = self.gh.review_comments_batch(list(range(1, 41)))
+        self.assertEqual({pr: len(comments) for pr, comments in result.items()}, dict.fromkeys(range(1, 41), 100))
+        self.assertEqual(len(self.gh.inline_requests), 4)
+        self.assertTrue(all(fields(args)["query"] == batch.REVIEW_QUERIES[10] for args in self.gh.inline_requests))
+        self.assertIn("reviewThreads(first:10,", batch.REVIEW_QUERIES[10])
+        self.assertIn("comments(first:100)", batch.REVIEW_QUERIES[10])
+
     def test_nested_pagination_bigints_and_reply_root_mapping(self):
         root = 2**53 + 111
         # The highest-ID contest is neither the newest timestamp nor last item.
-        comments = [comment(root)] + [comment(root + i, f"contest {i}", root + i - 1) for i in range(1, 127)]
+        comments = [comment(root)] + [comment(root + i, f"contest {i}", root + i - 1) for i in range(1, 227)]
         comments[-1]["createdAt"] = "2026-01-01T00:00:00Z"
-        comments += [comment(root + 127, "<!--tauceti-reply:style-->", root)]
+        comments += [comment(root + 227, "<!--tauceti-reply:style-->", root)]
         # Root is on page one, eligible reply on page three; also >100 threads.
         self.gh.threads[1] = [[comment(i + 1)] for i in range(123)]
         self.gh.threads[1][21] = comments
         result = self.gh.review_comments_batch([1, 2])
         self.assertEqual(result[2], [])
-        self.assertEqual(len(result[1]), 250)
+        self.assertEqual(len(result[1]), 350)
         best = tc.ReviewState._newest_contest(result[1])
-        self.assertEqual(best, {"id": root + 126, "rubric": "style", "created_at": "2026-01-01T00:00:00Z"})
-        normalized = next(c for c in result[1] if c["id"] == root + 125)
+        self.assertEqual(best, {"id": root + 226, "rubric": "style", "created_at": "2026-01-01T00:00:00Z"})
+        normalized = next(c for c in result[1] if c["id"] == root + 225)
         self.assertEqual(normalized["in_reply_to_id"], root)
         self.assertIs(type(normalized["id"]), int)
         continuations = [fields(a) for a in self.gh.inline_requests if fields(a)["query"] == batch.REVIEW_THREAD_QUERY]
-        self.assertEqual([c["commentCursor"] for c in continuations], ["20", "120"])
+        self.assertEqual([c["commentCursor"] for c in continuations], ["100", "200"])
         self.assertTrue(all(c["threadCursor"] == "21" for c in continuations))
-        self.assertEqual(len(self.gh.inline_requests), 9)
+        self.assertEqual(len(self.gh.inline_requests), 15)
         self.assertEqual(self.gh.review, [])
 
     def test_highest_integer_id_not_last_reply_or_lexical_order(self):
@@ -146,17 +157,19 @@ class InlineBatchTests(unittest.TestCase):
         self.assertIsNone(result[1])
         self.assertEqual(len(result[2]), 23)
         self.assertEqual(result[11], [])
-        self.assertEqual(len(self.gh.inline_requests), 3)
+        self.assertEqual(len(self.gh.inline_requests), 4)
         continuation = fields(self.gh.inline_requests[1])
-        self.assertEqual((continuation["pr0"], continuation["cursor0"]), ("2", "20"))
+        self.assertEqual((continuation["pr0"], continuation["cursor0"]), ("2", "10"))
 
     def test_first_thread_continuation_omits_predecessor_and_exact_rest_shape(self):
-        self.gh.threads[1] = [[comment(2**31)] + [comment(2**31 + i, "contest", 2**31) for i in range(1, 23)]]
+        self.gh.threads[1] = [[comment(2**31)] + [comment(2**31 + i, "contest", 2**31) for i in range(1, 123)]]
         result = self.gh.review_comments_batch([1])[1]
         variables = fields(self.gh.inline_requests[-1])
+        self.assertEqual(len(self.gh.inline_requests), 2)
+        self.assertEqual(variables["query"], batch.REVIEW_THREAD_QUERY)
         self.assertNotIn("threadCursor", variables)
         self.assertEqual(
-            result[-1], {"id": 2**31 + 22, "body": "contest", "in_reply_to_id": 2**31, "created_at": STAMP}
+            result[-1], {"id": 2**31 + 122, "body": "contest", "in_reply_to_id": 2**31, "created_at": STAMP}
         )
 
     def test_invalid_ids_bodies_dates_and_ancestry_fail_unknown(self):
@@ -272,7 +285,7 @@ class InlineBatchTests(unittest.TestCase):
                 if kind == "comment_count":
                     edge["node"]["comments"]["totalCount"] += 1
                 if kind == "repeat":
-                    edge["node"]["comments"]["pageInfo"]["endCursor"] = "20"
+                    edge["node"]["comments"]["pageInfo"]["endCursor"] = "100"
                 return subprocess.CompletedProcess([], 0, json.dumps(data), "")
 
             self.gh.transform = transform
@@ -302,11 +315,11 @@ class InlineBatchTests(unittest.TestCase):
         self.gh.transform = lambda reply, variables: reply
         with patch.object(batch, "REVIEW_MAX_PAGES", 2):
             self.assertEqual(self.gh.review_comments_batch([1, 2]), {1: None, 2: []})
-            self.gh.threads = {1: [[comment()] + [comment(i, "contest", 1) for i in range(2, 125)]]}
+            self.gh.threads = {1: [[comment()] + [comment(i, "contest", 1) for i in range(2, 225)]]}
             self.assertEqual(self.gh.review_comments_batch([1, 2]), {1: None, 2: []})
 
     def test_routing_exact_documents_and_repository_only(self):
-        self.gh.threads = {1: [[comment()] + [comment(i, "contest", 1) for i in range(2, 23)]]}
+        self.gh.threads = {1: [[comment()] + [comment(i, "contest", 1) for i in range(2, 125)]]}
         self.gh.review_comments_batch(list(range(1, 11)))
         for args in self.gh.inline_requests:
             self.assertTrue(github_app.public_read(args, [self.gh.repo]))
