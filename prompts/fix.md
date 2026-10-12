@@ -25,13 +25,14 @@ For each finding, judge whether it is actually correct:
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If a finding means the PR's target is not on any roadmap, say so in your report and stop.
 - Must stay green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force a change through — that is itself a reason to push back on the finding.
 
-## Verify before pushing (all three MUST pass)
+## Verify before pushing
 ```
 lake exe cache get
 lake build
-lake exe axioms
 ```
-Iterate until green. Never push red.
+Iterate until green. Never push red. Do not run the full local axiom audit: trusted CI runs it on
+the submitted commit. Before pushing, use the source constraints above to reject `sorry`,
+`native_decide`, new axioms, and `maxHeartbeats` overrides in the diff.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
@@ -45,4 +46,4 @@ Iterate until green. Never push red.
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: which findings you fixed (and how you verified each), which you contested (and the evidence), and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: which findings you fixed (and how you verified each), which you contested (and the evidence), and the exact `lake build` result line proving the local build is green. Trusted CI performs the full axiom audit on the submitted commit. Do not claim green unless you saw it.

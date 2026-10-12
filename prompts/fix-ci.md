@@ -16,10 +16,11 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
   rm -f "$base_shims"; rm -rf "$base_root"
   lake build
-  lake exe axioms
   lake exe module-system
   bash scripts/lint-env.sh
   ```
+  Run `lake exe axioms` locally only when the failed CI log specifically reports an axiom-audit
+  failure. Otherwise trusted CI owns the full audit on the submitted commit.
   If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main (CI
   overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
 
@@ -46,12 +47,13 @@ if [ "$have_base" = 1 ] && git diff --quiet "$base_ref" -- lake-manifest.json le
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"; rm -rf "$base_root"
 lake build
-lake exe axioms
 lake exe module-system
 bash scripts/lint-env.sh
 ```
-Iterate until every one is green. A green `lake build` alone is NOT enough — the `build` check also
-fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring). Never push red.
+If the failed CI log specifically reports an axiom-audit failure, also run `lake exe axioms` and
+iterate until it is green. Otherwise do not run the full audit locally; trusted CI reruns it on the
+submitted commit. A green `lake build` alone is NOT enough — the `build` check also fails on the
+module-system and lint-env checks above. Never push red.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
@@ -65,4 +67,4 @@ fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing do
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: what was failing, the root cause, what you changed (or that you only re-triggered transient CI), and the exact shim-expiry / `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: what was failing, the root cause, what you changed (or that you only re-triggered transient CI), and the exact shim-expiry, `lake build`, module-system, and lint result lines proving the local checks are green. If the original failure was axiom-related, include the exact `lake exe axioms` result too; otherwise trusted CI performs that audit. Do not claim green unless you saw it.

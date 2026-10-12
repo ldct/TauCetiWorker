@@ -44,7 +44,7 @@ Once you have settled on a target, derive a short stable id for it and claim it 
 - Everything under `namespace TauCeti`. Classic `import Mathlib...` syntax is simplest.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If the step you want is not on a roadmap, pick a different target or stop without a PR, and say so in your report.
 - Aim for ~200–600 lines of genuine, non-vacuous content. A shorter PR that closes a milestone beats a longer peripheral one, and smaller-but-green beats bigger-but-broken. No tautologies, no `True`-placeholder fields, no vacuous definitions. Follow Mathlib naming/docstring conventions, and never silence a linter or use `set_option`.
-- Must build green AND pass the axiom audit (allowlist: `propext`, `Classical.choice`, `Quot.sound`; no `sorry`/`native_decide`/new axioms/`maxHeartbeats`).
+- Must build green and remain axiom-clean (allowlist: `propext`, `Classical.choice`, `Quot.sound`; no `sorry`/`native_decide`/new axioms/`maxHeartbeats`). Trusted CI performs the full axiom audit on the submitted commit.
 
 ## Review your own diff, before you verify
 Compiling is not passing review, and the rubrics are what decide whether this PR merges. Audit
@@ -67,16 +67,17 @@ Make only fixes you can justify against a rubric. Do NOT broaden the PR, add spe
 generality, or invent findings to look diligent: scope is itself a rubric, and a sound small PR
 beats a padded one. If nothing needs changing, say so and move on. Then verify, once:
 
-## Verify before pushing (all three MUST pass)
+## Verify before pushing
 ```
 lake exe cache get
 lake build
-lake exe axioms
 ```
 If `lake build` is red, FIX IT or retreat (below). Never push red.
+Do not run the full axiom audit locally; trusted CI runs it on the submitted commit. Review the diff
+for `sorry`, `native_decide`, new axioms, and `maxHeartbeats` overrides before pushing.
 
 
-**Do this synchronously, in this one turn.** Run the three commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
+**Do this synchronously, in this one turn.** Run the verification commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
 
 ## If the target won't close
 Never downgrade to a lookalike: a weakened statement, a degenerate special case, or scaffolding carrying the result's name. Retreat one rung at a time:

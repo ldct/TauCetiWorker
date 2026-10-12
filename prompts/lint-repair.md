@@ -39,12 +39,13 @@ if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-exp
 rm -f "$base_shims"; rm -rf "$base_root"
 lake build --iofail
 lake env lean --run scripts/DuplicateDeclarations.lean
-lake exe axioms
 lake exe module-system
 bash scripts/lint-env.sh
 bash scripts/lint-style.sh
 ```
-Iterate until every one is green, and `lint-env.sh` prints `LINT-ENV: PASS`. Never push red.
+Iterate until every one is green, and `lint-env.sh` prints `LINT-ENV: PASS`. Never push red. Do not
+run the full axiom audit locally; trusted CI runs it on the submitted commit. Reject `sorry`,
+`native_decide`, new axioms, and `maxHeartbeats` overrides while reviewing the repair diff.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
