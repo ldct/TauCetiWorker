@@ -278,8 +278,19 @@ def _api_public_read(args: list[str], allowed: set[str]) -> bool:
         i += 1
     if endpoint == "graphql":
         from .github import _OPEN_PRS_QUERY, _PR_PROGRESS_QUERY
+        from .github_comments import COMMENTS_QUERIES
 
         query = fields.get("query")
+        # Exact trusted documents only: variables cannot introduce fields or mutations.
+        for size, document in COMMENTS_QUERIES.items():
+            if query == document:
+                required = {"query", "owner", "name"} | {f"pr{i}" for i in range(size)}
+                optional = {f"cursor{i}" for i in range(size)}
+                return (
+                    required <= set(fields) <= required | optional
+                    and all(re.fullmatch(r"[1-9][0-9]*", fields[f"pr{i}"]) for i in range(size))
+                    and f"{fields.get('owner')}/{fields.get('name')}".lower() in allowed
+                )
         name = fields.get("repo") if query == _OPEN_PRS_QUERY else fields.get("name")
         return (
             query in (_OPEN_PRS_QUERY, _PR_PROGRESS_QUERY, _REVIEW_THREADS_QUERY)

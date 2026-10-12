@@ -39,6 +39,7 @@ RUN_STDLIB=(
   github_failure_reason.py
   github_app.py
   github_app_setup.py
+  github_comments_batch.py
   github_identity.py
   github_ratelimit.py
   github_diagnostics.py

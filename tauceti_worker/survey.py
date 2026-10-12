@@ -11,6 +11,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
@@ -751,7 +752,12 @@ def survey(
     results = {}
     if progress:
         progress(f"Checking PR reviews: 0/{len(review_prs)}")
-    with ThreadPoolExecutor(max_workers=SURVEY_WORKERS, thread_name_prefix="survey") as pool:
+    # Finish bounded issue-comment prefetch before starting any per-PR readers. Its
+    # scoped results outlive the short memo, but never escape this read-only phase.
+    with (
+        rs.survey_comments([p.number for p in review_prs]) if deep else nullcontext(),
+        ThreadPoolExecutor(max_workers=SURVEY_WORKERS, thread_name_prefix="survey") as pool,
+    ):
         pending = {pool.submit(_survey_review, p, cfg, gh, rs, counters, deep): p.number for p in review_prs}
         for future in as_completed(pending):
             results[pending[future]] = future.result()
