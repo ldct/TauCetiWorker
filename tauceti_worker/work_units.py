@@ -11,7 +11,6 @@ import random
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from dataclasses import dataclass, replace
@@ -80,7 +79,7 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
-from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_run, me
+from .github import GitHub, GitHubError, claims_repo, ensure_fork, gh_run, me
 from .intentions import avoid_list
 from .paths import CLAIM_SH, HERE
 from .quota import Quota, _unavail_reason, mirror_creds
@@ -1290,7 +1289,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     "--store",
                     str(w.cfg.store_dir),
                     "--post",
-                    "--no-sync",
+                    "--no-archive",
                     "--reviewer",
                     reviewers,
                     *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
@@ -1334,21 +1333,6 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
 
                 select("no-work")
                 return None
-            # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
-            # Publish them to TauCetiData with the host's creds. The posted scoreboard is the live
-            # auto-merge verdict; TauCetiData is the analytics/provenance archive, so a sync failure is
-            # visible and non-lossy but must not turn a successfully posted review into failed work.
-            srv = _sync_review_outbox(w, pr)
-            if srv != 0:
-                # A push-capable host hit an archive outage (auth, network, remote, or local checkout).
-                # Keep the records for the next review's whole-outbox retry and warn, but continue the
-                # successful review path: the scoreboard already landed and can drive auto-merge.
-                warn_red(
-                    f"review #{pr}: review posted and counts for auto-merge, but publishing its "
-                    f"analytics/provenance records to TauCetiData FAILED — records kept in "
-                    f"{w.cfg.store_dir / 'outbox'}. This archive failure is NOT charged to the PR; "
-                    f"check the host's git/gh credentials. A later review retries the whole outbox."
-                )
             if c.contest:
                 # The engine advanced replies_through in the new scoreboard (the durable per-reply
                 # watermark); rs.bust below re-fetches it, so this contest won't re-fire once the 👀
@@ -1361,7 +1345,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:
             # The engine stopped because the reviewer's provider is unusable — a revoked credential or
             # an exhausted subscription window — and it deliberately posted nothing (TauCetiReview#117).
-            # That is MACHINE-WIDE in the same sense as an archive service outage: the next
+            # That is MACHINE-WIDE: the next
             # PR the loop picks would abort identically, so charging it to whichever PR happened to be
             # this round's candidate is charging a PR for someone else's outage. Three of them strand
             # that PR at MAX_REVIEW_ERRORS: dropped from review candidacy and given a public "Review
@@ -1398,71 +1382,6 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         # the contest be retried. A crash before here leaves the 👀 to TTL out (CONTEST_CLAIM_TTL).
         if c.contest and c.contest_reply_id and not w.gh.remove_reaction(c.contest_reply_id):
             log(f"  review #{pr}: contest claim (👀) failed to release — it will TTL out in {CONTEST_CLAIM_TTL // 60}m")
-
-
-def _sync_review_outbox(w: Worker, pr: int) -> int:
-    """Drain the worker's review outbox into TauCetiData using the host's gh/git creds. Reviews run
-    with --no-sync (a bubble can't push to TauCetiData), so the host publishes here. Returns the
-    engine rc: nonzero means the push failed after archive.sync's retries (the outbox is preserved
-    write-if-absent, so a later round re-drains it). An empty outbox is a no-op — a round that
-    produced no new records is not a publish failure."""
-    outbox = w.cfg.store_dir / "outbox"
-    if not outbox.is_dir() or not any(p.is_file() for p in outbox.rglob("*")):
-        return 0
-    # A contributor without write access to TauCetiData cannot push archive records there. The review
-    # itself already counts through its posted scoreboard; retain the records locally for a future
-    # contributor-publishing path without treating archival as operational review state.
-    # The maintainer's identity returns push=true, so the sync below runs and a genuine outage still
-    # surfaces loudly. A failed/ambiguous check falls through to the sync (preserving the loud-fail).
-    archive_repo = os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData")
-    if not archive_repo:
-        return 0
-    if can_push(archive_repo) is False:
-        log(
-            f"  review #{pr}: no write access to TauCetiData — review posted and counts for "
-            f"auto-merge; analytics/provenance records kept in {outbox}"
-        )
-        return 0
-    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")  # a local engine checkout, for pre-merge tests
-    if eng:
-        argv = [
-            sys.executable,
-            str(Path(eng) / "runner" / "cli.py"),
-            str(pr),
-            "--sync-only",
-            "--store",
-            str(w.cfg.store_dir),
-        ]
-    else:
-        argv = [
-            "uvx",
-            "--from",
-            f"git+https://github.com/{REVIEW}"
-            + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
-            "tauceti-review",
-            str(pr),
-            "--sync-only",
-            "--store",
-            str(w.cfg.store_dir),
-        ]
-    # The sync echoes a full `$ …python …/archive.py sync --store … --data-dir …` command line and a
-    # "synced N file(s)" line. Capture it so that noise stays out of the main log, surfacing only a
-    # one-line summary; keep the detail in a subsidiary file only when the sync FAILS (the diagnosable case).
-    if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv).returncode
-    p = subprocess.run(argv, capture_output=True, text=True)
-    if p.returncode == 0:
-        m = re.search(r"synced (\d+) file", (p.stdout or "") + (p.stderr or ""))
-        log(f"  review #{pr}: synced {m.group(1) if m else '?'} record(s) to TauCetiData")
-    else:
-        logf = w.cfg.logdir / f"sync-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
-        try:
-            w.cfg.logdir.mkdir(parents=True, exist_ok=True)
-            logf.write_text((p.stdout or "") + (p.stderr or ""))
-            log(f"  review #{pr}: TauCetiData sync FAILED (rc={p.returncode}); detail → {logf}")
-        except OSError:
-            log(f"  review #{pr}: TauCetiData sync FAILED (rc={p.returncode})")
-    return p.returncode
 
 
 def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:

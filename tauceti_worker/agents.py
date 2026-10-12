@@ -2602,9 +2602,8 @@ def _review_in_bubble(
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
     model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
     engine would otherwise fetch and run it OFFLINE: the engine itself, the roadmap, and the review
-    store are host→container mounts; `--no-sync` makes the engine archive review records to the mounted
-    outbox but NOT push (the bubble can't reach TauCetiData) — do_review drains that outbox to
-    TauCetiData host-side afterwards. The only traffic that
+    store are host→container mounts; `--no-archive` disables archive outbox creation and
+    TauCetiData uploads while retaining local review results and ledgers. The only traffic that
     crosses the boundary is the engine's TauCeti code clone + PR API + scoreboard post (all scoped to
     TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine and its shared Tools dependency are mounted as source and run with the image's
     python3 — no package downloads inside the container.
@@ -2664,7 +2663,7 @@ def _review_in_bubble(
     inner = (
         "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine:/opt/tools python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
-        f"{mathlib_flag} --no-sync --no-coordinate --store /opt/review-store --post "
+        f"{mathlib_flag} --no-archive --no-coordinate --store /opt/review-store --post "
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
     )

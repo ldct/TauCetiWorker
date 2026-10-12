@@ -11,9 +11,8 @@ outage lasting one quota window could strand several unrelated PRs. Review worke
 `--ignore-quota` precisely so they do not pace, which is what makes that a live risk rather than a
 theoretical one.
 
-This is the same carve-out the TauCetiData publish failure and the host-binary preflight already
-make, in the same words: machine-wide, so warn loudly and raise NoProgress rather than bump a
-per-PR counter.
+This is the same carve-out the host-binary preflight already makes: machine-wide, so warn loudly
+and raise NoProgress rather than bump a per-PR counter.
 
 Pinned here:
 
@@ -80,9 +79,8 @@ def drive(rc, state):
     c = types.SimpleNamespace(pr=42, head="a" * 40, contest=None, contest_reply_id=None)
     opts = types.SimpleNamespace(work_model="claude")
     sv = types.SimpleNamespace()
-    orig_run, orig_sync, orig_me = tc.work_units.run_to_logfile, tc.work_units._sync_review_outbox, tc.work_units.me
+    orig_run, orig_me = tc.work_units.run_to_logfile, tc.work_units.me
     tc.work_units.run_to_logfile = lambda *a, **k: rc
-    tc.work_units._sync_review_outbox = lambda *a, **k: 0
     tc.work_units.me = lambda: "tester"
     try:
         out = tc.work_units.do_review(w, sv, c, opts, bubble=False)
@@ -90,7 +88,7 @@ def drive(rc, state):
     except tc.config.NoProgress as e:
         return w, e, None
     finally:
-        tc.work_units.run_to_logfile, tc.work_units._sync_review_outbox, tc.work_units.me = orig_run, orig_sync, orig_me
+        tc.work_units.run_to_logfile, tc.work_units.me = orig_run, orig_me
 
 
 def main():

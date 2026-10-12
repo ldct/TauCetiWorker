@@ -243,9 +243,9 @@ class Config:
         # Two different homes, and conflating them is what made the macOS isolation change risky.
         # `home` answers "whose credentials?" and must follow the login user, because the macOS
         # Keychain, gh and git are per-login-user stores. `data_home` answers "whose working data?"
-        # and must follow the WORKER, because the review store holds an outbox of unpublished
-        # records and the scoreboard/thread ids: point it somewhere new and a worker silently
-        # abandons reviews it never sent and re-posts scoreboards it already posted.
+        # and must follow the WORKER, because the review store holds local results and
+        # scoreboard/thread ids: point it somewhere new and a worker loses telemetry
+        # and re-posts scoreboards it already posted.
         #
         # isolate_home() exports $TAUCETI_DATA_HOME (children inherit it); an unisolated worker has
         # none and its data lives under the login home exactly as before. Every isolated worker's
