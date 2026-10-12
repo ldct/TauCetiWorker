@@ -16,9 +16,13 @@ from datetime import datetime
 from .github_comments import _failed_aliases
 
 REVIEW_BATCH_SIZE = 10
+REVIEW_THREADS_PAGE = 10
+REVIEW_COMMENTS_PAGE = 100
 REVIEW_MAX_PAGES = 100  # independently for each PR's threads and each thread's comments
-# At most 10 * (20 threads + 20 * 20 comments), even counting replyTo objects < 10k
-# nodes, comfortably below GitHub's 500k node limit. Continuations are smaller still.
+# At most 10 * (10 threads + 10 * 100 comments), or ~20k nodes counting
+# replyTo objects, well below GitHub's 500k node limit. Initial comments use the
+# full page so ordinary threads with <=100 comments need no extra HTTP request.
+# Cap root threads at ten to keep the larger initial comment page bounded.
 _COMMENT_FIELDS = (
     "totalCount nodes{fullDatabaseId body createdAt replyTo{fullDatabaseId}} pageInfo{hasNextPage endCursor}"
 )
@@ -27,8 +31,8 @@ REVIEW_QUERIES = {
     + ",".join(f"$pr{i}:Int!,$cursor{i}:String" for i in range(size))
     + "){repository(owner:$owner,name:$name){"
     + "".join(
-        f"pr{i}:pullRequest(number:$pr{i}){{number reviewThreads(first:20,after:$cursor{i}){{"
-        "totalCount edges{cursor node{id comments(first:20){"
+        f"pr{i}:pullRequest(number:$pr{i}){{number reviewThreads(first:{REVIEW_THREADS_PAGE},after:$cursor{i}){{"
+        f"totalCount edges{{cursor node{{id comments(first:{REVIEW_COMMENTS_PAGE}){{"
         + _COMMENT_FIELDS
         + "}}} pageInfo{hasNextPage endCursor}}}"
         for i in range(size)
@@ -40,7 +44,9 @@ REVIEW_THREAD_QUERY = (
     "query($owner:String!,$name:String!,$pr0:Int!,$threadCursor:String,$commentCursor:String!){"
     "repository(owner:$owner,name:$name){pr0:pullRequest(number:$pr0){number "
     "reviewThreads(first:1,after:$threadCursor){totalCount edges{cursor node{id "
-    "comments(first:100,after:$commentCursor){" + _COMMENT_FIELDS + "}}} pageInfo{hasNextPage endCursor}}}}}"
+    f"comments(first:{REVIEW_COMMENTS_PAGE},after:$commentCursor){{"
+    + _COMMENT_FIELDS
+    + "}}} pageInfo{hasNextPage endCursor}}}}}"
 )
 
 
@@ -148,7 +154,7 @@ def _thread_comments(gh, repo, pr, edge, before, thread_total):
     accumulated, seen = [], set()
     expected = None
     for page in range(REVIEW_MAX_PAGES):
-        comments, total, more, cursor = _page(connection, "nodes", 20 if page == 0 else 100)
+        comments, total, more, cursor = _page(connection, "nodes", REVIEW_COMMENTS_PAGE)
         if expected is None:
             expected = total
         if total != expected or (cursor is not None and cursor in seen):
@@ -204,7 +210,7 @@ def fetch_review_comments(
                 if f"pr{i}" in failed:
                     continue
                 try:
-                    edges, total, more, cursor = _threads(repository[f"pr{i}"], pr, 20)
+                    edges, total, more, cursor = _threads(repository[f"pr{i}"], pr, REVIEW_THREADS_PAGE)
                     if total != totals.setdefault(pr, total):
                         raise ValueError("thread count changed")
                     before = cursors.get(pr)
