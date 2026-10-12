@@ -36,6 +36,7 @@ from .constants import (
 from .github_comments import fetch_issue_comments
 from .github_identity import CACHE_ENV as IDENTITY_CACHE_ENV
 from .github_identity import cached_personal_login
+from .github_review_comments import fetch_review_comments
 from .review_diagnostics import public_diagnostic_quality
 
 
@@ -1157,6 +1158,10 @@ class GitHub:
             return [self._comment(n) for n in nodes] if nodes is not None else None
         except (KeyError, TypeError, ValueError):
             return None
+
+    def review_comments_batch(self, numbers: list[int]) -> dict[int, list[dict] | None]:
+        """Survey-only inline comments; fully paginate both threads and their replies."""
+        return fetch_review_comments(self._gh, self.repo, numbers)
 
     def review_comments(self, pr: int) -> list[dict] | None:
         """All review (inline / thread) comments for a PR — distinct from issue_comments. A contested

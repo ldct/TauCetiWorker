@@ -63,6 +63,7 @@ class ReviewState:
         self.sbcache = cfg.sbcache
         self._comments: dict[int, tuple[float, list[dict] | None]] = {}
         self._survey_comments: dict[int, list[dict] | None] = {}
+        self._survey_review_comments: dict[int, list[dict] | None] = {}
         self._observed: dict[int, str] = {}
         self._shared_issue_hit: dict[int, bool] = {}
         self._survey_facts: dict[int, dict] = {}
@@ -85,6 +86,7 @@ class ReviewState:
         pass. An empty `updated_at` is not recorded — "no clock" has to read as "cannot tell", which
         falls back to the plain TTL, not as a key that might match another blank."""
         self._survey_comments.clear()
+        self._survey_review_comments.clear()
         seen = {p.number: p.updated_at for p in prs if getattr(p, "updated_at", "")}
         # Drop memoized comments for any PR whose clock moved. The memo exists to coalesce the two
         # readers inside ONE pass; carried across a change it would hand a stale response to the fetch
@@ -149,7 +151,7 @@ class ReviewState:
             pass  # a cache we cannot write is a slow round, not a wrong one
 
     @contextmanager
-    def survey_comments(self, numbers: list[int]):
+    def survey_comments(self, numbers: list[int], *, heads: dict[int, str] | None = None):
         """Prefetch only cold/changed review PRs for this survey's parallel review phase.
 
         This separate, instance-local map survives arbitrarily slow prefetches/queued
@@ -158,6 +160,7 @@ class ReviewState:
         the sequential-per-PR REST behavior intentionally.
         """
         self._survey_comments.clear()
+        self._survey_review_comments.clear()
         try:
             batch = getattr(self.gh, "issue_comments_batch", None)
             if callable(batch):
@@ -180,9 +183,27 @@ class ReviewState:
                 if needed:
                     fetched = batch(needed)
                     self._survey_comments.update({pr: fetched.get(pr) for pr in needed})
+            inline_batch = getattr(self.gh, "review_comments_batch", None)
+            if heads and callable(inline_batch):
+                needed = []
+                for pr in numbers:
+                    facts = self._survey_facts.get(pr)
+                    if facts and facts.get("review_complete"):
+                        continue  # the shared-state snapshot already answers this pass
+                    sc = self._sidecar(self._contest_path(pr), pr)
+                    if sc is not None and "contest" in sc:
+                        continue
+                    # Inspect the same scoreboard as the review predicate, without
+                    # pre-writing its cache or changing author-phase freshness.
+                    if self._clean_head(self._survey_meta(pr)) == heads.get(pr):
+                        needed.append(pr)
+                if needed:
+                    fetched = inline_batch(needed)
+                    self._survey_review_comments.update({pr: fetched.get(pr) for pr in needed})
             yield
         finally:
             self._survey_comments.clear()
+            self._survey_review_comments.clear()
 
     def _issue_comments(self, pr: int, *, force: bool = False) -> list[dict] | None:
         """Memoize PR comment reads briefly within a survey pass, including failures.
@@ -274,6 +295,25 @@ class ReviewState:
             pass
         return Meta(data, "assumed" if self._shared_issue_hit.get(pr) else "fresh")
 
+    def _survey_meta(self, pr: int) -> dict:
+        """Read-only preview of gh_meta for inline prefetch selection (no cache writes)."""
+        facts = self._survey_facts.get(pr)
+        if facts and facts.get("issue_complete"):
+            return facts.get("meta") or {}
+        sc = self._sidecar(self._key_path(pr), pr)
+        if sc is not None:
+            if sc.get("status") == "present" and isinstance(sc.get("meta"), dict):
+                return sc["meta"]
+            if sc.get("status") == "missing":
+                return {}
+        cache = self._cache_path(pr)
+        if not self._observed.get(pr) and cache.exists():
+            cached = self._load(cache)
+            if time.time() - cache.stat().st_mtime < SBCACHE_TTL and cached is not None:
+                return cached
+        comments = self._issue_comments(pr)
+        return (self._load(cache) if comments is None else scoreboard(comments)) or {}
+
     @staticmethod
     def _load(cache: Path) -> dict | None:
         """The cached meta, or None when there isn't a usable one. `{}` is a legitimate scoreboard (an
@@ -298,10 +338,14 @@ class ReviewState:
         self._shared_issue_hit.pop(pr, None)
         self._survey_facts.pop(pr, None)
         self._survey_comments.pop(pr, None)
+        self._survey_review_comments.pop(pr, None)
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
-        meta = self.gh_meta(pr).data
+        return self._clean_head(self.gh_meta(pr).data)
+
+    @staticmethod
+    def _clean_head(meta: dict) -> str:
         if meta.get("mode") == "init":
             return ""
         states = meta.get("states") or {}
@@ -345,14 +389,18 @@ class ReviewState:
         {'id', 'rubric', 'created_at'} of the newest such reply."""
         if force:
             self._survey_facts.pop(pr, None)
+            self._survey_review_comments.pop(pr, None)
         facts = self._survey_facts.get(pr)
         if facts and facts.get("review_complete"):
             return facts.get("contest")
         sc = None if force else self._sidecar(self._contest_path(pr), pr)
         if sc is not None and "contest" in sc:
             return sc["contest"]
-        with read_context(fresh=force, revision=self._observed.get(pr, "")):
-            rcs = self.gh.review_comments(pr)
+        if not force and pr in self._survey_review_comments:
+            rcs = self._survey_review_comments[pr]
+        else:
+            with read_context(fresh=force, revision=self._observed.get(pr, "")):
+                rcs = self.gh.review_comments(pr)
         if rcs is None:
             return None  # a fetch FAILURE answers nothing and must not be cached as "no contest"
         best = self._newest_contest(rcs)
