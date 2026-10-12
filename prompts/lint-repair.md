@@ -15,7 +15,16 @@ If the merge conflicts, resolve it (conflicts can only be in `TauCeti/`), or sto
 
 Repair existing declarations only: restate, re-annotate, or (if redundant) remove them. Do NOT add new lemmas or definitions: new mathematics needs a roadmap target, which a repair PR does not have. If a violation can only be fixed by adding one, stop and say so in your report.
 
-The PR body and its comments list the violations the daily lint found, but always work from the current full lint: `bash scripts/lint-env.sh` with `LINT_ONLY_MODULES` unset lints the whole library and prints each new violation with the linter's explanation.
+The PR body and its comments list the violations the daily lint found, and this PR's CI build lints the whole library, so its failing log is the current list: each violation with the linter's explanation. Work from that list, and from the latest daily-lint comment if it is newer than the last build. Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`: that lints the whole library, which takes minutes on every core of a machine other agents share. CI runs the environment lint; leave the whole-library lint to it. To check your repairs locally, lint only the modules that define the flagged declarations. The log names each one as `<linter> <declaration>`; collect the modules whose source mentions each declaration's last name component (a few extra modules only cost a little time):
+```
+lint_modules="$(mktemp)"
+for name in <the last component of each flagged declaration name>; do
+  grep -rlw --include='*.lean' -- "$name" TauCeti
+done | sed 's/\.lean$//; s|/|.|g' | sort -u > "$lint_modules"
+test -s "$lint_modules" && cat "$lint_modules"
+LINT_ONLY_MODULES="$lint_modules" bash scripts/lint-env.sh
+```
+If `test -s` fails, or a name is auto-generated (for example an `inst...` instance) and grep misses its file, add the defining module by hand: the scoped lint silently skips the `#lint` driver when the list names no real module, so an empty list passes without checking anything. Confirm the output line `lint-env: linted N changed module(s)` has N > 0. CI re-runs the full lint when you push.
 
 - For a failing check's CI logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
 - If the failure is genuinely transient infra (e.g. a cache fetch timeout) and everything below passes locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
@@ -23,7 +32,11 @@ The PR body and its comments list the violations the daily lint found, but alway
 ## Rules of the repo (hard constraints)
 - Fix code under `TauCeti/` only. Do NOT edit `scripts/` (including `scripts/lint-baseline.txt` and `scripts/lint-nolints-allowlist.txt`), `.github/`, the lakefile, or the Lake pins. Do NOT add `@[nolint ...]`: every nolint must be allowlisted in a human-owned file, so CI rejects it. If a violation genuinely should be an exception, stop and say so in your report instead of silencing it.
 - Do NOT edit the root `TauCeti.lean`: it is intentionally empty.
-- Everything under `namespace TauCeti`. Tau Ceti does not preserve backwards compatibility: if you rename or restate a lemma, update every use in the repository in the same change.
+- Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
+  existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
+  `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
+  Tau Ceti does not preserve backwards compatibility: if you rename or restate a lemma, update every
+  use in the repository in the same change.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), and no `set_option` in `TauCeti/` at all (CI rejects it; it is how `maxHeartbeats` overrides and linter silencing happen).
 
@@ -40,10 +53,10 @@ rm -f "$base_shims"; rm -rf "$base_root"
 lake build --iofail
 lake env lean --run scripts/DuplicateDeclarations.lean
 lake exe module-system
-bash scripts/lint-env.sh
+LINT_ONLY_MODULES="$lint_modules" bash scripts/lint-env.sh   # the list built above
 bash scripts/lint-style.sh
 ```
-Iterate until every one is green, and `lint-env.sh` prints `LINT-ENV: PASS`. Never push red. Do not
+Iterate until every one is green, and the scoped `lint-env.sh` prints `LINT-ENV: PASS`. Never push red. Do not
 run the full axiom audit locally; trusted CI runs it on the submitted commit. Reject `sorry`,
 `native_decide`, new axioms, and `maxHeartbeats` overrides while reviewing the repair diff.
 

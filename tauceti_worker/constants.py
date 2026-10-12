@@ -46,10 +46,10 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # merge gate in TauCetiRoadmap must run the SAME version, or the worker can emit headers the gate does
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
-# This fork adds only the gh fork CLI fix to the gate's 6d26dd3 release; report/header
+# This fork adds only the gh fork CLI fix to the gate's b7d96c7 release; report/header
 # generation is unchanged, so it remains compatible with the pinned roadmap gate.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "ldct/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "edd3e9dae0f91b0b7a5778d632f7ec017d818a55")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "f721873fb789e30094e93228804dd117a7fba8b4")
 # A full uv source URL permits a pinned, locally audited checkout during an emergency repair without
 # editing a disposable uvx environment. Production normally leaves this unset and uses GitHub.
 PROGRESS_SOURCE = os.environ.get("TAUCETI_PROGRESS_SOURCE", f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}")
@@ -146,6 +146,7 @@ ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min h
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
+EX_ADMISSION_WAIT = 76  # API funding/queue/throughput wait, outside the round timeout
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
@@ -250,16 +251,17 @@ AGENT_NAMES = {
 
 # Reproducible authoring defaults. Provider selection remains quota-driven; once
 # selected, host and bubble launchers consume this exact model/effort profile.
-# Review models are configured separately by the review engine.
+# Claude reviews share this default; other review models follow the review engine's policy.
 CODEX_AUTHORING_FALLBACK_MODEL = "gpt-6-luna"
 # A model entitlement normally changes only when an account's subscription changes. Keep the
 # side-effect-free access probe out of every round while still noticing an upgrade promptly.
 CODEX_MODEL_ACCESS_TTL = 3600
 AUTHORING_DEFAULTS = {
-    # Prefer flagship Sol for authoring. A cached preflight probe selects the verified Luna fallback
-    # only when Codex confirms that this repository default is unavailable.
-    # Pin Claude to the current exact Opus generation, not its moving alias.
-    "codex": ("gpt-6-sol", "high"),
+    # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
+    # that this repository default is unavailable to the current subscription.
+    "codex": ("gpt-6.1-sol", "high"),
+    # Pin Claude authoring, reviews and quota bootstrap to an exact model, not the moving opus alias.
+    # The review engine must price a new model first, so update TauCetiReview before this default.
     "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
     # id (for example claude-opus-5) with the existing --author-model flag.

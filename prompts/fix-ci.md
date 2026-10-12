@@ -17,10 +17,27 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   rm -f "$base_shims"; rm -rf "$base_root"
   lake build
   lake exe module-system
-  bash scripts/lint-env.sh
   ```
   Run `lake exe axioms` locally only when the failed CI log specifically reports an axiom-audit
   failure. Otherwise trusted CI owns the full audit on the submitted commit.
+  The `build` check also runs the environment lint, on the TauCeti modules the PR changes. Run it
+  locally scoped the same way:
+  ```
+  lint_modules="$(mktemp)"
+  {
+    git diff --name-only --diff-filter=d origin/main...HEAD -- 'TauCeti/*.lean'
+    # Only if the PR carries the `full-lint` label (see below):
+    # for name in <last component of each declaration the failing log flags>; do
+    #   grep -rlw --include='*.lean' -- "$name" TauCeti
+    # done
+  } | sed 's/\.lean$//; s|/|.|g' | sort -u > "$lint_modules"
+  LINT_ONLY_MODULES="$lint_modules" bash scripts/lint-env.sh
+  ```
+  Never run `bash scripts/lint-env.sh` without `LINT_ONLY_MODULES`: that lints the whole library, which takes minutes on every core of a machine other agents share. CI runs the environment lint; leave the whole-library lint to it.
+  If the PR carries the `full-lint` label, CI lints the whole library instead, so the changed
+  modules are not enough: uncomment the loop above, listing the last name component of each
+  declaration the failing log flags (`<linter> <declaration>`), so their defining modules are
+  linted too.
   If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main (CI
   overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
 
@@ -32,7 +49,9 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 
 ## Rules of the repo (hard constraints)
 - Code goes under `TauCeti/`. Do NOT edit the root `TauCeti.lean`: it is intentionally empty, and the lakefile's glob (`TauCeti.*`) builds every module under `TauCeti/`, so there is no need to touch it. Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
-- Everything under `namespace TauCeti`.
+- Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
+  existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
+  `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, say so in your report and stop.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 
@@ -48,8 +67,8 @@ if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-exp
 rm -f "$base_shims"; rm -rf "$base_root"
 lake build
 lake exe module-system
-bash scripts/lint-env.sh
 ```
+Then run the scoped environment lint above and confirm it prints `LINT-ENV: PASS`.
 If the failed CI log specifically reports an axiom-audit failure, also run `lake exe axioms` and
 iterate until it is green. Otherwise do not run the full audit locally; trusted CI reruns it on the
 submitted commit. A green `lake build` alone is NOT enough — the `build` check also fails on the

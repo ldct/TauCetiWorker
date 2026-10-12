@@ -3,11 +3,13 @@ argv path and the repo-scoped bubble sandbox path (plus per-worker $HOME isolati
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -657,7 +659,10 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
         env.pop("ANTHROPIC_API_KEY", None)
-        base = shlex_split(CLAUDE_CMD) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
+        command = (
+            os.environ.get("TAUCETI_CLAUDE_CMD", CLAUDE_CMD) if os.environ.get("TAUCETI_API_CONTEXT") else CLAUDE_CMD
+        )
+        base = shlex_split(command) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
         argv = [*base, "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", profile.model]
         if profile.effort:
             argv += ["--effort", profile.effort]
@@ -666,20 +671,43 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
 
 
 def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path) -> int:
+    global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
+    if any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+        prompt += (
+            "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
+            "checkout and current main. The public `tauceti-public` Lake service remains configured "
+            "during this run. After merging/rebasing, changing the toolchain or dependencies, or "
+            "repairing a malformed workspace, fetch both caches before building:\n"
+            "lake exe cache get\n"
+            f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} "
+            f"--max-revs={lake_cache_max_revs(os.environ)}\n"
+            "A transport or incomplete-artifact download failure is infrastructure trouble: report "
+            "it instead of falling back to a full source compilation."
+            " If TAUCETI_PR_CACHE_MISS=1, your PR history is uncached: merge/rebase onto current main "
+            "and fetch again before building; if that cannot be done, report the cache miss and stop."
+        )
     argv, env = host_agent_argv(prompt, profile)
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return run_agent_proc(
-        argv,
-        env=env,
-        cwd=cwd,
-        logdir=logdir,
-        label=f"agent-{profile.provider}",
-        provider=profile.provider,
-        stdin_text=prompt if profile.provider == "codex" else None,
-    )
+    _LAST_AGENT_FAILURE = None
+    with host_build_cache_context(cwd, env, logdir):
+        rc = run_agent_proc(
+            argv,
+            env=env,
+            cwd=cwd,
+            logdir=logdir,
+            label=f"agent-{profile.provider}",
+            provider=profile.provider,
+            stdin_text=prompt if profile.provider == "codex" else None,
+        )
+    if rc == 75:
+        from .claude_api import blocked_reason
+
+        if reason := blocked_reason():
+            _LAST_AGENT_FAILURE = "local API admission unavailable: " + reason
+    return rc
 
 
 # Provider statuses that mean "the service could not serve this request right now", as opposed to
@@ -884,12 +912,16 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     detail that belongs in a subsidiary per-review log, not the orchestration stream. TAUCETI_STREAM=1
     streams to the terminal instead. Tails logf to the main log on a non-zero exit so failures aren't
     silent. The caller logs a one-line pointer to logf so the detail is discoverable."""
+    from .claude_api import review_environment
+
+    api_env = review_environment()
+    env_kwargs = {"env": api_env} if api_env is not None else {}
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv).returncode
+        return subprocess.run(argv, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
-        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
+        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
@@ -937,6 +969,192 @@ TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
 TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
 
 
+class BuildCacheUnavailable(NoProgress):
+    """A known pre-agent outage, never chargeable to a PR's attempt budget."""
+
+    def __init__(self, message: str, *, log_file: Path | None = None):
+        super().__init__(message)
+        self.log_file = log_file
+
+
+HOST_CACHE_TIMEOUT = 1200
+_LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
+
+
+def lake_cache_max_revs(env: dict) -> str:
+    value = env.get("LAKE_CACHE_MAX_REVS", "100")
+    if not re.fullmatch(r"[0-9]+", value):
+        raise Die("LAKE_CACHE_MAX_REVS must be a natural number")
+    return value
+
+
+@contextlib.contextmanager
+def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
+    """Keep the public service available through repairs, merges and dependency changes."""
+    if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+        yield
+        return
+    with tempfile.TemporaryDirectory(prefix="tauceti-lake-config-") as tmp:
+        config = Path(tmp) / "lake.toml"
+        config.write_text(
+            f'[[cache.service]]\nname = "{TAUCETI_CACHE_SERVICE}"\nkind = "s3"\n'
+            f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
+            f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
+        )
+        env["LAKE_CONFIG"] = str(config)
+        env.pop("TAUCETI_PR_CACHE_MISS", None)
+        env.setdefault("LAKE_ARTIFACT_CACHE", "1")
+        env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
+        warm_host_build_caches(cwd, env, logdir)
+        yield
+
+
+def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
+    """Terminate downloader children on timeout or interruption (including round SIGTERM).
+
+    SIGKILL cannot run Python cleanup; normal manager/round shutdown sends SIGTERM first.
+    """
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=output,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        return proc.wait(timeout=timeout)
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        raise
+
+
+def warm_host_build_caches(cwd: Path, env: dict, logdir: Path) -> None:
+    """Fetch both caches on the selected branch; warm main too for subsequent rebases.
+
+    Genuine workspace errors must reach repair agents. Transport, publication and partial-download
+    failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
+    retain successful downloads. All fetches together have one twenty-minute deadline.
+    """
+    max_revs = lake_cache_max_revs(env)
+    logdir.mkdir(parents=True, exist_ok=True)
+    logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    deadline = time.monotonic() + HOST_CACHE_TIMEOUT
+    log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
+
+    def unavailable(reason: str):
+        message = f"{reason}; agent not started (see {logf})"
+        log(message)
+        report_failure(message, code=75, log_file=logf)
+        raise BuildCacheUnavailable(message, log_file=logf)
+
+    def fetch(label: str, command: list[str]) -> str:
+        for attempt in range(1, 3):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                unavailable("build cache preparation deadline exceeded")
+            with logf.open("ab") as output:
+                offset = output.tell()
+                output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
+                output.flush()
+                try:
+                    rc = _cache_fetch(command, cwd, env, output, remaining)
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    output.write(f"cache command failed: {e}\n".encode())
+                    rc = 1
+            with logf.open("rb") as output:
+                output.seek(offset)
+                detail = output.read().decode(errors="replace")
+            if rc == 0:
+                log(f"host build caches: {label} cache ready")
+                return "ready"
+            # Preserve real outages even when Lake also wraps them in a dependency-fetch error.
+            transport_error = re.search(
+                r"(?i)(?:\bHTTP\b|status(?: code)?|response)[^\n]*\b(?:401|403|429|5\d\d)\b|"
+                r"could not resolve host|connection (?:reset|refused|timed out)|"
+                r"SSL certificate|\bTLS\b|authentication failed|network is unreachable",
+                detail,
+            )
+            # These errors precede artifact transfer and can be repaired in the checked-out PR.
+            workspace_error = re.search(
+                r"(?im)^error:.*(?:lakefile\.(?:toml|lean)|lake-manifest\.json|"
+                r"could not resolve revision|unknown revision|invalid manifest|"
+                r"invalid toolchain name|"
+                r"no (?:such release|release found)|could not download nonexistent lean version)|"
+                r"(?im:couldn't find remote ref|unknown package)",
+                detail,
+            )
+            # Lake wraps every failed git fetch with the same dependency error. Only positive
+            # evidence of a missing ref/repository belongs to repair; unknown failures stay outages.
+            missing_dependency = re.search(r"failed to fetch (?:the )?package revision", detail) and re.search(
+                r"(?i)not our ref|unadvertised object|repository ['\"][^\n]*['\"] not found|"
+                r"couldn't find remote ref",
+                detail,
+            )
+            if (workspace_error or missing_dependency) and not transport_error:
+                log(f"warning: {label} cache cannot load this workspace; leaving it to the repair agent")
+                for line in detail.splitlines()[-8:]:
+                    log("  cache: " + line)
+                return "workspace-error"
+            # Lake's CLI emits these only after all revision lookups returned 404 (Main.lean).
+            if label != "Mathlib" and re.search(
+                r"^error:.*(?:no outputs found|outputs not found for revision)", detail, re.M
+            ):
+                return "miss"
+            if attempt == 1:
+                log(f"host build caches: {label} fetch failed; retrying verified downloads")
+                continue
+            for line in detail.splitlines()[-12:]:
+                log("  cache: " + line)
+            unavailable(f"{label} build cache download failed")
+        raise AssertionError("unreachable")
+
+    if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
+        return
+    if env.get("LAKE_ARTIFACT_CACHE", "1").lower() in _LAKE_FALSE:
+        log("host build caches: TauCeti artifact caching explicitly disabled by LAKE_ARTIFACT_CACHE")
+        return
+    base = ["lake", "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI]
+    result = fetch("TauCeti", [*base, f"--max-revs={max_revs}"])
+    if result == "workspace-error":
+        return
+
+    def git(*args: str) -> str:
+        p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+        return p.stdout.strip() if p.returncode == 0 else ""
+
+    main = git("rev-parse", "--verify", "origin/main")
+    head = git("rev-parse", "HEAD")
+    if main and main != head:
+        # An explicit toolchain fetch also primes the store for a rebase that changes Lean versions.
+        toolchain = git("show", "origin/main:lean-toolchain")
+        revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), "origin/main")
+        for revision in revisions.splitlines():
+            status = fetch(
+                "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])]
+            )
+            if status != "miss":
+                if status == "workspace-error":
+                    return
+                break
+        else:
+            unavailable("TauCeti main cache has no published outputs in the requested history")
+    elif result == "miss":
+        unavailable("TauCeti main cache has no published outputs in the requested history")
+    if result == "miss":
+        env["TAUCETI_PR_CACHE_MISS"] = "1"
+        log("warning: PR history is uncached; current main artifacts are ready for the rebase")
+
+
 def bubble_cmd() -> list[str]:
     """Resolve the Bubble CLI. The uvx fallback is suitable for dry-run capability probes only;
     real sandbox rounds require an installed executable because Bubble owns host-global services."""
@@ -963,6 +1181,11 @@ def _bubble_open_help() -> str:
 def bubble_supports_allow_push() -> bool:
     """Does the resolved Bubble support repo-scoped fork pushes?"""
     return "--allow-push" in _bubble_open_help()
+
+
+def bubble_supports_github_account() -> bool:
+    """Account selection must reach the shared proxy, not just the Bubble CLI process."""
+    return re.search(r"(?<![\w-])--github-account(?=[\s=,]|$)", _bubble_open_help()) is not None
 
 
 def bubble_supports_lake_cache_service() -> bool:
@@ -1070,6 +1293,8 @@ def _bubble_proxy_endpoint_healthy(*, newer_than: int | None = None, expected_ve
         capabilities = endpoint.get("capabilities")
         if not isinstance(capabilities, list) or "allow-push" not in capabilities:
             return False
+        if os.environ.get("TAUCETI_GITHUB_ACCOUNT") and "github-account" not in capabilities:
+            return False
         if expected_version is not None and endpoint.get("bubble_version") != expected_version:
             return False
         pid = endpoint.get("pid")
@@ -1126,7 +1351,7 @@ def ensure_fork_proxy_current() -> None:
     `gh proxy start`. The refresh is serialized under a host-global file lock so concurrent TauCeti workers
     do not race; Bubble separately serializes all service installers. Fail-CLOSED throughout: if the refresh
     cannot publish a fresh endpoint we Die rather than burn a long round that cannot authenticate. Call this
-    ONLY for rounds that push to a fork — a review-only worker must not be blocked by it."""
+    for fork authoring or an explicitly selected GitHub account, including selected-account reviews."""
     import fcntl
 
     # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails.
@@ -1143,7 +1368,7 @@ def ensure_fork_proxy_current() -> None:
             if _bubble_proxy_endpoint_healthy():
                 return
             raise Die(
-                "preflight: fork authoring needs Bubble installed at a stable path; the uvx fallback "
+                "preflight: fork authoring and GitHub account selection need Bubble installed at a stable path; the uvx fallback "
                 "cannot safely own a host-global launchd/systemd daemon. Install dev-bubble or set "
                 "$TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
             )
@@ -1157,22 +1382,22 @@ def ensure_fork_proxy_current() -> None:
             detail = (e.stderr or e.stdout or "").strip()[-500:]
             suffix = f"\n  Bubble said: {detail}" if detail else ""
             raise Die(
-                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
                 f"refreshed: {e}{suffix}"
             ) from e
         except (OSError, subprocess.SubprocessError) as e:
             raise Die(
-                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
                 f"refreshed: {e}\n"
                 "  Restart it yourself with `bubble gh proxy start`, then re-run."
             ) from e
         if not _wait_bubble_proxy_endpoint_healthy(newer_than=endpoint_mtime, expected_version=version or None):
             raise Die(
                 "preflight: `bubble gh proxy start` returned success but did not publish a reachable "
-                "fresh auth-proxy endpoint with fork-push support. Check ~/.bubble/auth-proxy.log and "
+                "fresh auth-proxy endpoint with the required GitHub capabilities. Check ~/.bubble/auth-proxy.log and "
                 "/tmp/bubble-auth-proxy.log, then re-run."
             )
-        log("bubble auth-proxy: restarted daemon with fork --allow-push support")
+        log("bubble auth-proxy: restarted daemon with the required GitHub capabilities")
     finally:
         if lockf is not None:
             try:
@@ -1452,6 +1677,13 @@ def run_in_bubble(
     import shlex
 
     cfg, wm = w.cfg, opts.work_model
+    github_account = os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    if github_account and not os.environ.get("TAUCETI_AGENT_ECHO"):
+        if not bubble_supports_github_account():
+            raise Die(
+                "--github-account with --bubble requires account-aware Bubble; this install has no --github-account"
+            )
+        ensure_fork_proxy_current()
     # Review/probe commands bring their own model policy. Do not let an unrelated authoring override
     # (including a malformed effort value) prevent those isolated commands from running.
     profile = getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm) if inner_cmd is None else None
@@ -1484,6 +1716,30 @@ def run_in_bubble(
     _bubble_pop(cfg, env)  # clear any container a SIGKILLed prior round left behind
 
     mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
+    api_bridge = os.environ.get("TAUCETI_API_CONTEXT")
+    if api_bridge and _uses_claude_credentials(cred_model):
+        from .claude_api_client import atomic
+
+        bridge = Path(api_bridge)
+        api_bin = rounddir / "api-bin"
+        api_bin.mkdir(mode=0o700)
+        shutil.copy(Path(__file__).with_name("claude_api_client.py"), api_bin / "claude")
+        (api_bin / "claude").chmod(0o700)
+        keyfile = rounddir / "anthropic.key"
+        keyfile.write_text((bridge / "key").read_text())
+        keyfile.chmod(0o600)
+        w.rc.add_cleanup(lambda: keyfile.unlink(missing_ok=True))
+        settings = json.loads((bridge / "bin/config.json").read_text())
+        settings.update(command=["claude"], key="/opt/round/anthropic.key", bridge="/opt/api-bridge")
+        atomic(api_bin / "config.json", settings)
+        mount_flags += [
+            "--mount",
+            f"{api_bin}:/opt/api-bin:ro",
+            "--mount",
+            f"{bridge / 'inbox'}:/opt/api-bridge/inbox:rw",
+            "--mount",
+            f"{bridge / 'outbox'}:/opt/api-bridge/outbox:ro",
+        ]
     for m in mounts or []:
         mount_flags += ["--mount", m]
 
@@ -1493,12 +1749,19 @@ def run_in_bubble(
     # fork gets git only. (For a PR target, bubble also auto-derives the head fork, so this is belt-and-
     # suspenders for maintenance and the sole grant for authoring, which has no PR to derive from.)
     push_flags = ["--allow-push", allow_push] if allow_push else []
+    account_flags = ["--github-account", github_account] if github_account else []
+    if github_account:
+        account_flags += ["--git-name", os.environ["GIT_AUTHOR_NAME"], "--git-email", os.environ["GIT_AUTHOR_EMAIL"]]
 
     # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
     tcenv = "env PATH=/opt/round:$PATH"
+    if api_bridge and _uses_claude_credentials(cred_model):
+        tcenv = "env PATH=/opt/api-bin:/opt/round:$PATH"
+        if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
+            tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     for var in (
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",
@@ -1540,15 +1803,21 @@ def run_in_bubble(
         "--github-security",
         "allowlist-write-graphql",
         *push_flags,
+        *account_flags,
         *cache_flags,
         *mount_flags,
-        *agent_cred_flags(cred_model),
+        *(
+            ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+            if api_bridge and _uses_claude_credentials(cred_model)
+            else agent_cred_flags(cred_model)
+        ),
         "--command",
         command,
     ]
 
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print("BUBBLE " + " ".join(_shq(a) for a in argv))
+        (rounddir / "anthropic.key").unlink(missing_ok=True)
         return 0
 
     if allow_push and not _wait_bubble_proxy_endpoint_healthy(timeout=5):
@@ -1572,7 +1841,7 @@ def run_in_bubble(
     # and override only Bubble's subprocess env (done after the echo path so a dry-run never prompts the
     # Keychain). Register cleanup before launch for signals; the normal finally removes it promptly too.
     claude_seed: Path | None = None
-    if _uses_claude_credentials(cred_model):
+    if _uses_claude_credentials(cred_model) and not api_bridge:
         claude_seed = _stage_claude_creds_for_bubble(cfg)
         if claude_seed is not None:
             env = {**env, "CLAUDE_CONFIG_DIR": str(claude_seed)}
@@ -1597,7 +1866,18 @@ def run_in_bubble(
         finally:
             if claude_seed is not None:
                 shutil.rmtree(claude_seed, ignore_errors=True)
+            (rounddir / "anthropic.key").unlink(missing_ok=True)
     return rc
+
+
+def _claude_review_model(reviewers: str) -> str | None:
+    """Pin direct Claude reviews to the shared default unless explicitly overridden."""
+    if "claude" not in [r.strip() for r in reviewers.split(",")]:
+        return None
+    configured = (os.environ.get("TAUCETI_CLAUDE_MODEL") or "").strip()
+    model = configured or AUTHORING_DEFAULTS["claude"][0]
+    _reject_retired_opus(model, "$TAUCETI_CLAUDE_MODEL" if configured else "repository default")
+    return model
 
 
 def _codex_review_model_override(reviewers: str) -> str | None:
@@ -1649,6 +1929,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     # uses --repo-dir for its files and an absolute temp workdir).
     import shlex
 
+    claude_model = _claude_review_model(reviewers)
+    claude_flag = f" --claude-model {shlex.quote(claude_model)}" if claude_model else ""
     cm = _codex_review_model_override(reviewers)
     codex_flag = f" --codex-model {shlex.quote(cm)}" if cm else ""  # operator override; else engine default
     km = _kiro_review_model(reviewers)
@@ -1658,8 +1940,11 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
         f"--no-mathlib --no-archive --store /opt/review-store --post "
         f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
-        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}{codex_flag}{kiro_flag}"
+        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
+        f"{claude_flag}{codex_flag}{kiro_flag}"
     )
+    if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api":
+        inner += " --auth api"
     if km:
         # The review engine creates another clean reviewer HOME. Seed this
         # container's provider-only credential first so that clean-room copy has

@@ -3,6 +3,7 @@ its work unit (review/fix/fix-ci/rebase/bump/roadmap) on the host or in a bubble
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,8 @@ from pathlib import Path
 
 from .agents import (
     AuthoringProfile,
+    BuildCacheUnavailable,
+    _claude_review_model,
     _codex_review_model_override,
     _kiro_review_model,
     fetch_git_source,
@@ -459,6 +462,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             f"nothing actionable on the requested PR(s) {', '.join(f'#{n}' for n in opts.prs)} this "
             f"round ({scope}) — see the per-PR reasons above; no unrelated work was done"
         )
+    # A focused progress worker otherwise throws away the survey's useful suppression reason here
+    # and the manager can only display the generic fallback below. Keep unrestricted auto mode quiet:
+    # progress is commonly not due there and roadmap/review contention can legitimately fall through.
+    if opts.only and "progress" in opts.only and sv.progress.suppressed:
+        reason = sv.progress.suppressed[0].reason
+        if reason:
+            raise NoProgress(f"progress: {reason}")
     raise NoProgress(f"no eligible work this round under {scope}")
 
 
@@ -796,6 +806,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         what = c.reason or (c.head[:12] if c.head else "")
     if stage == "review":
         detail = f"provider={opts.work_model}, sandbox={where}"
+        review_model = _claude_review_model(opts.work_model)
+        if review_model:
+            detail += f", model={review_model}"
     else:
         profile = _effective_authoring_profile(opts)
         effort = profile.effort or "none"
@@ -804,7 +817,26 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
-    rc = fn(w, sv, c, opts, bubble)
+    from .budget import BudgetError
+    from .claude_api import admission_failure, api_context, api_mode
+
+    with contextlib.ExitStack() as stack:
+        try:
+            api = stack.enter_context(
+                api_context(
+                    w.cfg.wid if api_mode() else "",
+                    stage,
+                    host=not bubble or stage == "progress",
+                    model=profile.model if profile else (review_model if stage == "review" else None),
+                )
+            )
+        except (BudgetError, OSError) as error:
+            if not api_mode():
+                raise
+            raise admission_failure(str(error)) from None
+        rc = fn(w, sv, c, opts, bubble)
+        if rc != 0 and api is not None and api.blocked_reason:
+            raise admission_failure(api.blocked_reason)
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
@@ -846,6 +878,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         else:
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
+            claude_model = _claude_review_model(reviewers)
             km = _kiro_review_model(reviewers)
             rc = run_to_logfile(
                 [
@@ -860,12 +893,14 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     "--no-archive",
                     "--reviewer",
                     reviewers,
+                    *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
                     "--expect-head",
                     head,
                     "--max-rounds-per-day",
                     str(REVIEW_DAILY_CAP),
                     "--submitted-by",
                     me(),
+                    *(["--claude-model", claude_model] if claude_model else []),
                     *(["--codex-model", cm] if cm else []),
                     *(["--kiro-model", km] if km else []),
                 ],
@@ -873,6 +908,12 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 f"review #{pr}",
             )
         log(f"  review #{pr}: engine rc={rc}")
+        from .claude_api import blocked_reason
+
+        if rc != 0 and (reason := blocked_reason()):
+            from .claude_api import admission_failure
+
+            raise admission_failure(reason)
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
             # the "errored without posting a verdict" streak. Otherwise a pre-post error streak (e.g. errkey=2) could
@@ -956,6 +997,14 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
     per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
     """
+    from .claude_api import blocked_reason
+
+    if reason := blocked_reason():
+        for key in charged:
+            w.counters.write(key, max(0, w.counters.read(key) - 1))
+        from .claude_api import admission_failure
+
+        raise admission_failure(reason)
     reason = take_last_agent_infra_failure()
     if not reason:
         return
@@ -1029,7 +1078,14 @@ def _do_fixlike(
         checked = rev.stdout.strip() or head
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
-        rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+        try:
+            rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+        except BuildCacheUnavailable:
+            # Unlike a transcript-derived provider failure, we know the agent never started.
+            # A persistent cache outage must not exhaust the bounded provider-refund allowance.
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            raise
     if rc == 0:
         w.rs.bust(pr)
     else:
@@ -1213,6 +1269,11 @@ def _do_progress_inner(w, opts) -> int | None:
     # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
     # round, for ever.
     w.counters.write("progress-attempt-ts", int(time.time()))
+    # Consume the survey's cached verdict as soon as this worker commits to the attempt. In particular,
+    # a failure must not leave a cached `due=true` ahead of the attempt-gap/error checks in
+    # progress_due(): that used to launch the same broken plan every few minutes until all three error
+    # slots were spent. The next survey now observes the durable attempt timestamp and waits eight hours.
+    bust_progress_cache(w.cfg)
 
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
@@ -1321,6 +1382,12 @@ def _do_progress_inner(w, opts) -> int | None:
     )
     rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
     if rc != 0:
+        from .claude_api import blocked_reason
+
+        if reason := blocked_reason():
+            from .claude_api import admission_failure
+
+            raise admission_failure(reason)
         w.counters.incr("progress-err")
         raise Die(f"the writing agent exited {rc}")
     for f in (status_body, section_body):

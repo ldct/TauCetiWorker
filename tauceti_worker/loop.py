@@ -3,22 +3,54 @@ timeout, then settle (short pause if productive, escalating back-off otherwise).
 
 from __future__ import annotations
 
+import contextlib
+import os
 import signal
 import subprocess
 import sys
 import time
 
 from .agents import resolve_authoring_profile
+from .budget import Budget, BudgetError, money
+from .claude_api import api_mode
 from .config import Config, NoProgress, log
-from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
+from .constants import (
+    BACKOFF_BASE,
+    BACKOFF_MAX,
+    EX_ADMISSION_WAIT,
+    EX_NOPROGRESS,
+    GH_MIN_BUDGET,
+    INTERROUND,
+    OPENROUTER_MODELS,
+    POLL,
+)
 from .github import github_budget
-from .quota import Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
+from .quota import RATE_LIMIT_RECHECK_MAX_S, Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 
 
 class _LoopTerminated(KeyboardInterrupt):
     """SIGTERM translated to the same teardown path as Ctrl-C, with the right exit code."""
+
+
+def _recheck_in(prov: Provider | None, now: float) -> int:
+    """How long until it is worth reading this provider's usage again, while waiting for quota.
+
+    A rate-limited endpoint (HTTP 429): its Retry-After, capped at RATE_LIMIT_RECHECK_MAX_S, and that
+    cap beats even a longer POLL. Any other Retry-After is honored as given. Otherwise the moment a
+    blocking window frees (hourly at most, so sibling workers and operator activity are still
+    observed), else the next poll. Never sooner than POLL: the next read would only re-trip a limit."""
+    if prov is None:
+        return POLL
+    if prov.rate_limited and prov.error:  # no usable reading; a cached one waits on its own clock below
+        cap = RATE_LIMIT_RECHECK_MAX_S
+        return int(max(min(POLL, cap), min(prov.retry_after or POLL, cap)))
+    if prov.retry_after:
+        return int(max(POLL, prov.retry_after))
+    if prov.next_eligible:
+        return max(POLL, min(int(prov.next_eligible - now) + 5, 3600))
+    return POLL
 
 
 def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
@@ -59,7 +91,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
     round and exits. Keeps the escalating back-off that stopped ~700 no-op rounds hammering a
     rate-limited GitHub."""
-    unpaced = agent in OPENROUTER_MODELS or agent == "kiro"
+    unpaced = agent in OPENROUTER_MODELS or agent == "kiro" or api_mode()
     ignore_quota = getattr(args, "ignore_quota", False)
     bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
@@ -70,6 +102,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     )
     report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
+    admission_streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate(_signum, _frame) -> None:
@@ -80,6 +113,25 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
+                try:
+                    snapshot = Budget().snapshot(worker=cfg.wid)
+                    blocked = (
+                        snapshot["unresolved"]
+                        or money(snapshot["available"]) <= 0
+                        or money(snapshot["available"]) < money(snapshot["admission_threshold"])
+                    )
+                    if blocked:
+                        Budget().refresh_waiter(cfg.wid)
+                    reason = "unresolved session cost" if snapshot["unresolved"] else "waiting for funding"
+                except (BudgetError, OSError) as error:
+                    blocked, reason, snapshot = True, str(error), {}
+                if blocked:
+                    wake = snapshot.get("funding_at")
+                    nap = max(1, min(60, (wake - time.time() + 1) if wake else 60))
+                    report_runtime("waiting-budget", detail=reason, budget=snapshot, next_action_at=time.time() + nap)
+                    time.sleep(nap)
+                    continue
             report_runtime(
                 "checking-quota",
                 detail="checking provider availability",
@@ -114,11 +166,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     verdict, pending_init = "run", True
                 if verdict == "wait":
                     why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
-                    # Honor the endpoint's Retry-After, else wait until the blocking window is next
-                    # eligible (capped), else poll. Never sooner than POLL, so we don't re-trip a 429.
-                    nap = max(POLL, int(prov.retry_after) if (prov and prov.retry_after) else 0)
-                    if prov and not prov.retry_after and prov.next_eligible:
-                        nap = max(nap, min(int(prov.next_eligible - time.time()) + 5, 3600))
+                    nap = _recheck_in(prov, time.time())
                     # A loop DOES wait this out, so the wording stays — but a rejected credential is not
                     # something waiting fixes, and an unattended loop can poll on one indefinitely, so
                     # name the command that ends it here too.
@@ -137,18 +185,15 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 if model is None and claude_pending_init(snap):
                     model, pending_init = "claude", True
                 if model is None:
-                    # Honor a provider's Retry-After (e.g. a 429 asking for 580s) over the fixed poll, so
-                    # we don't re-trip a rate limit by polling sooner than the server asked.
-                    nap = max(POLL, max((p.retry_after or 0 for p in snap.values()), default=0))
-                    if not any(p.retry_after for p in snap.values()):
-                        eligible = [p.next_eligible for p in snap.values() if p.next_eligible]
-                        if eligible:
-                            # A forced refresh is valuable before a launch, not every five minutes
-                            # throughout a known multi-hour wait. Recheck at least hourly so sibling
-                            # workers or operator activity are still observed reasonably promptly. A
-                            # pace-blocked window reports when the budget overtakes its usage, which is
-                            # usually well before its reset, so this sleeps to the line, not past it.
-                            nap = max(nap, min(int(min(eligible) - time.time()) + 5, 3600))
+                    # Wake for whichever provider can change first. An idle/unknown alternative may
+                    # become usable at the next poll, so another provider's distant reset or long
+                    # Retry-After must not hide that. Waking early for one provider cannot re-trip
+                    # another's rate limit: the pacer will not ask an endpoint that is still cooling
+                    # down after a 429 (Quota._cooldown_left), it reuses the last answer instead. A
+                    # pace-blocked window reports when the budget overtakes its usage, which is usually
+                    # well before its reset, so a long wait sleeps to the line, not past it.
+                    now = time.time()
+                    nap = min((_recheck_in(p, now) for p in snap.values()), default=POLL)
                     # Neither destination renders Rich markup: log() writes to stderr and a file, and a
                     # runtime-status detail is read back as data.
                     waiting = _wait_quota_line(snap, markup=False)
@@ -180,6 +225,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
 
             # 2) Run ONE round as a child in its own process group, under the hard timeout.
             tail = ["--worker-id", cfg.wid]
+            if api_mode():
+                tail += ["--claude-billing", "api"]
+                if os.environ.get("TAUCETI_USE_BUDGET") == "1":
+                    tail.append("--budget")
+                if keyfile := os.environ.get("TAUCETI_ANTHROPIC_KEY_FILE"):
+                    tail += ["--anthropic-api-key-file", keyfile]
             if only:
                 tail += ["--only", ",".join(only)]
             # --pr must travel to the child for the same reason --account does: the child is what
@@ -214,6 +265,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             account = getattr(args, "account", None)
             if account:
                 tail += ["--account", account]
+            github_account = getattr(args, "github_account", None)
+            if github_account:
+                tail += ["--github-account", github_account]
             if bubble:
                 tail.append("--bubble")
             source = getattr(args, "source", None)
@@ -221,6 +275,19 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 tail += ["--source", source]
             report_runtime("surveying", detail="selecting the next work unit", next_action_at=None)
             rc = run_round_subprocess(tail)
+
+            if rc == EX_ADMISSION_WAIT:
+                streak = 0
+                admission_streak += 1
+                nap = min(60, 5 * (1 << min(admission_streak - 1, 4)))
+                with contextlib.suppress(BudgetError, OSError):
+                    Budget().refresh_waiter(cfg.wid)
+                report_runtime(
+                    "waiting-budget", detail="rechecking local API admission", next_action_at=time.time() + nap
+                )
+                time.sleep(nap)
+                continue
+            admission_streak = 0
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.
             if rc == 0:
