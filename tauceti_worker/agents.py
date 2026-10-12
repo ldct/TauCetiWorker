@@ -1603,9 +1603,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
     model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
     engine would otherwise fetch and run it OFFLINE: the engine itself, the roadmap, and the review
-    store are host→container mounts; `--no-sync` makes the engine archive review records to the mounted
-    outbox but NOT push (the bubble can't reach TauCetiData) — do_review drains that outbox to
-    TauCetiData host-side afterwards. The only traffic that
+    store are host→container mounts; `--no-archive` disables archive outbox creation and
+    TauCetiData uploads while retaining local review results and ledgers. The only traffic that
     crosses the boundary is the engine's TauCeti code clone + PR API + scoreboard post (all scoped to
     TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine has no
     Python deps, so we run the mounted source with the image's python3 — no uvx/uv/PyPI.
@@ -1640,7 +1639,7 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     inner = (
         "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
-        f"--no-mathlib --no-sync --store /opt/review-store --post "
+        f"--no-mathlib --no-archive --store /opt/review-store --post "
         f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}{codex_flag}{kiro_flag}"
     )

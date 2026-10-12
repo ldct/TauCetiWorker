@@ -6,6 +6,7 @@ overrides must leave its default/fallback policy untouched.
 """
 
 import os
+import shlex
 import sys
 import tempfile
 import types
@@ -68,6 +69,10 @@ os.environ.pop("TAUCETI_REVIEW_CODEX_MODEL", None)
 agents.review_in_bubble(w, 470, "abc123", "codex", opts)
 check("bubble: unset -> no --codex-model, engine default stands", "--codex-model" not in captured["inner"])
 check("bubble: codex reviewer still seeds codex creds", captured["cred"] == "codex")
+engine_argv = shlex.split(captured["inner"])
+check("bubble: engine still posts the scoreboard", "--post" in engine_argv)
+check("bubble: engine disables archive creation and uploads", "--no-archive" in engine_argv)
+check("bubble: obsolete archive sync flags are absent", not {"--no-sync", "--sync-only"}.intersection(engine_argv))
 
 os.environ["TAUCETI_REVIEW_CODEX_MODEL"] = "gpt-5.6-terra"
 agents.review_in_bubble(w, 470, "abc123", "codex", opts)

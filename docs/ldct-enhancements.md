@@ -15,6 +15,10 @@ rounds before upgrading it.
 
 ## Included changes
 
+- Worker reviews disable TauCetiData archiving (`--no-archive`) on both host and
+  bubble paths. No outbox creation, archive permission probes, or host-side sync;
+  local results/ledgers and PR posting remain intact.
+
 - Public-read GitHub App authentication and local registration/installation flow,
   from `feat/github-app-public-reads` (`39f9869`). See
   [GitHub App reads](github-app-reads.md).

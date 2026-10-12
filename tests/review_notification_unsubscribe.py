@@ -231,13 +231,10 @@ def worker(state, raises=False):
 
 def test_review_lifecycle():
     wu = tc.work_units
-    saved = {
-        name: getattr(wu, name) for name in ("run_to_logfile", "review_in_bubble", "_sync_review_outbox", "me", "log")
-    }
-    calls, logs = [], []
+    saved = {name: getattr(wu, name) for name in ("run_to_logfile", "review_in_bubble", "me", "log")}
+    logs = []
     wu.run_to_logfile = lambda *args: 0
     wu.review_in_bubble = lambda *args: 0
-    wu._sync_review_outbox = lambda w, pr: calls.append(("sync", pr)) or 0
     wu.me = lambda: "authenticated-login"
     wu.log = logs.append
     candidate = types.SimpleNamespace(pr=42, head="a" * 40, contest=None, contest_reply_id=None)
@@ -248,21 +245,18 @@ def test_review_lifecycle():
             host = worker(state)
             check("host posted review stays successful", wu.do_review(host, None, candidate, opts, bubble=False), 0)
             check("host success mutes notifications", host.gh.muted, [42])
-            check("host success continues archive sync", calls, [("sync", 42)])
 
-            calls.clear()
             bubble = worker(state)
             check("bubble posted review stays successful", wu.do_review(bubble, None, candidate, opts, bubble=True), 0)
             check("bubble success mutes notifications", bubble.gh.muted, [42])
 
-            calls.clear()
             failed_mute = worker(state, raises=True)
             check(
                 "mute exception does not fail posted review",
                 wu.do_review(failed_mute, None, candidate, opts, bubble=False),
                 0,
             )
-            check("mute exception does not skip archive sync", calls, [("sync", 42)])
+            check("mute exception does not skip scoreboard invalidation", failed_mute.rs.busted, [42])
             check("mute exception is logged", any("notifications FAILED unexpectedly" in line for line in logs))
 
             wu.run_to_logfile = lambda *args: 7
