@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,6 +62,7 @@ class ReviewState:
         self.gh = gh
         self.sbcache = cfg.sbcache
         self._comments: dict[int, tuple[float, list[dict] | None]] = {}
+        self._survey_comments: dict[int, list[dict] | None] = {}
         self._observed: dict[int, str] = {}
         self._shared_issue_hit: dict[int, bool] = {}
         self._survey_facts: dict[int, dict] = {}
@@ -82,6 +84,7 @@ class ReviewState:
         left the open list must go back to being unobserved rather than keep an answer from a previous
         pass. An empty `updated_at` is not recorded — "no clock" has to read as "cannot tell", which
         falls back to the plain TTL, not as a key that might match another blank."""
+        self._survey_comments.clear()
         seen = {p.number: p.updated_at for p in prs if getattr(p, "updated_at", "")}
         # Drop memoized comments for any PR whose clock moved. The memo exists to coalesce the two
         # readers inside ONE pass; carried across a change it would hand a stale response to the fetch
@@ -145,8 +148,51 @@ class ReviewState:
         except OSError:
             pass  # a cache we cannot write is a slow round, not a wrong one
 
+    @contextmanager
+    def survey_comments(self, numbers: list[int]):
+        """Prefetch only cold/changed review PRs for this survey's parallel review phase.
+
+        This separate, instance-local map survives arbitrarily slow prefetches/queued
+        tasks, unlike COMMENTS_MEMO_S. It is cleared even if a task raises, and never
+        used for forced dispatch reads. Legacy GitHub fakes without batching retain
+        the sequential-per-PR REST behavior intentionally.
+        """
+        self._survey_comments.clear()
+        try:
+            batch = getattr(self.gh, "issue_comments_batch", None)
+            if callable(batch):
+                needed = []
+                for pr in numbers:
+                    facts = self._survey_facts.get(pr)
+                    if facts and facts.get("issue_complete"):
+                        continue  # the shared-state snapshot already answers this pass
+                    sc = self._sidecar(self._key_path(pr), pr)
+                    if sc is not None and (
+                        sc.get("status") == "missing"
+                        or (sc.get("status") == "present" and isinstance(sc.get("meta"), dict))
+                    ):
+                        continue
+                    hit = self._comments.get(pr)
+                    if hit and 0 <= time.time() - hit[0] < COMMENTS_MEMO_S:
+                        self._survey_comments[pr] = hit[1]
+                    else:
+                        needed.append(pr)
+                if needed:
+                    fetched = batch(needed)
+                    self._survey_comments.update({pr: fetched.get(pr) for pr in needed})
+            yield
+        finally:
+            self._survey_comments.clear()
+
     def _issue_comments(self, pr: int, *, force: bool = False) -> list[dict] | None:
-        """Memoize PR comment reads briefly within a survey pass, including failures."""
+        """Memoize PR comment reads briefly within a survey pass, including failures.
+
+        A survey-scoped batch prefetch (see survey_comments) answers first unless this is a forced read."""
+        if force:
+            # Never resurrect a prefetched answer after an explicit fresh read.
+            self._survey_comments.pop(pr, None)
+        elif pr in self._survey_comments:
+            return self._survey_comments[pr]
         hit = None if force else self._comments.get(pr)
         if hit and time.time() - hit[0] < COMMENTS_MEMO_S:
             return hit[1]
@@ -251,6 +297,7 @@ class ReviewState:
         self._comments.pop(pr, None)
         self._shared_issue_hit.pop(pr, None)
         self._survey_facts.pop(pr, None)
+        self._survey_comments.pop(pr, None)
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:

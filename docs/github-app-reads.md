@@ -77,6 +77,30 @@ personal authentication. No installation permissions are broadened. Add another
 repository to `public_repositories` only after verifying it is public; to offload
 review rubric refs/trees, include `TauCetiProject/TauCetiReview`.
 
+## Survey discussion-comment batching
+
+Deep surveys prefetch only build-green, non-draft PRs whose scoreboard/marker
+cache cannot answer at the observed `updatedAt`. Discussion (issue) comments are
+read in batches of at most ten PRs before the existing parallel review checks.
+Forty cold PRs with at most 100 comments each therefore require four comment
+requests; unchanged cached PRs require none. Inline review/contest comments and
+all write paths are unchanged.
+
+The App router recognizes exactly ten built-in query documents (sizes 1–10),
+with an explicitly allowed repository and PR numbers/cursors passed as variables.
+Every comments connection is paginated with `first:100`, independently, up to
+100 pages per PR. Errors, null/malformed data, inconsistent counts, cursor loops,
+or the page cap discard that PR's entire fetched history as a failure, not an
+empty or partial success. Unaffected aliases remain usable; failures retain the
+existing stale-cache behavior and do not trigger a REST fallback.
+
+Prefetched results belong only to the current `ReviewState` review phase, survive
+slow prefetch/queued tasks without the short comment memo expiring, and are
+cleared after the pool joins (including on errors). Forced dispatch reads always
+bypass them. This adds no shared/cross-worker cache or review-pool policy changes.
+Library/test GitHub adapters without a batch method retain the original per-PR
+read path. Validation is offline: `uv run python tests/github_comments_batch.py`.
+
 ## Personal identity cache
 
 CLI startup anchors `TAUCETI_GITHUB_IDENTITY_CACHE` to an absolute path before

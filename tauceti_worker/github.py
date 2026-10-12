@@ -33,6 +33,7 @@ from .constants import (
     OPEN_PR_PAGE,
     TAUCETI,
 )
+from .github_comments import fetch_issue_comments
 from .github_identity import CACHE_ENV as IDENTITY_CACHE_ENV
 from .github_identity import cached_personal_login
 from .review_diagnostics import public_diagnostic_quality
@@ -1074,6 +1075,10 @@ class GitHub:
                 # the original request if it exceeds this context budget.
                 return body if len(body) <= 32768 else ""
         return ""
+
+    def issue_comments_batch(self, numbers: list[int]) -> dict[int, list[dict] | None]:
+        """Survey-only discussion comments, fully paginated in bounded GraphQL batches."""
+        return fetch_issue_comments(self._gh, self.repo, numbers)
 
     def issue_comments(self, pr: int) -> list[dict] | None:
         """Complete GraphQL history in REST shape. Cache is triage-only; force reads bypass it."""
