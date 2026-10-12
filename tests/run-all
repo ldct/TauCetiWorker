@@ -157,6 +157,7 @@ RUN_STDLIB=(
   ssl_cert_file.py
   status_labels.py
   survey_concurrency.py
+  survey_ready_to_merge.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py

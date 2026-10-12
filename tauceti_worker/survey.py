@@ -910,6 +910,10 @@ def survey(
             and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         )
     ]
+    # Treat ready-to-merge as terminal for task selection, even if other labels,
+    # changed heads or contest replies disagree. Keep these PRs in inventory and
+    # roadmap backpressure, but never spend per-PR reads/prefetch on them.
+    candidates = [p for p in nondraft if "ready-to-merge" not in {label.lower() for label in p.labels}]
     if progress:
         progress("Checking GitHub identity and permissions…")
     me_login = me()
@@ -918,12 +922,12 @@ def survey(
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
     bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
-        p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in nondraft
+        p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in candidates
     )
     tend_bot = bot_on_canonical and can_push(TAUCETI) is True
     tended = [
         p
-        for p in nondraft
+        for p in candidates
         if (p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
     ]
@@ -940,7 +944,7 @@ def survey(
         return ready
 
     sv.n_open_nondraft = len(nondraft)
-    sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
+    sv.n_reviewable = sum(1 for p in candidates if p.build_success)
     sv._mine_open_prs = mine
     sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
@@ -1035,7 +1039,7 @@ def survey(
     #    OR a fresh author CONTEST reply landed since the last review at a clean head (→ contest path,
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without completing a review is escalated, not silently dropped.
-    review_prs = [p for p in nondraft if p.build_success] if "review" in enabled else []
+    review_prs = [p for p in candidates if p.build_success] if "review" in enabled else []
     results = {}
     if progress:
         progress(f"Checking PR reviews: 0/{len(review_prs)}")
