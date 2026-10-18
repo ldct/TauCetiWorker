@@ -167,13 +167,37 @@ not inject GitHub credentials into the review engine's tokenless model environme
 
 ## Bounded REST post-review notification muting
 
-After a successful review, the Worker searches up to three pages of 100 repository
-notifications (`all=true`, including read notifications), stopping when it finds
-that PR's thread. It then makes one REST subscription PUT with `ignored=true`.
+After a successful review, the Worker reuses a cached personal notification thread
+ID, or searches up to three pages of 100 repository notifications (`all=true`,
+including read notifications), stopping after the page containing that PR's thread.
+Every valid PR thread mapping on every fetched page is cached, including other PRs.
+It then makes one REST subscription PUT with `ignored=true`. A cache hit removes
+the lookup reads, **not the PUT**: another review can re-subscribe the account,
+so even a previous confirmed mute never suppresses a subsequent write.
 Both lookup and write stay personal; this path makes no GraphQL calls. Read
 requests retain normal transient retries, but the write is never retried.
 Missing threads or threads outside the first 300 entries are logged as failures;
 there is no unbounded history scan or GraphQL fallback.
+
+Thread IDs are shared across worker processes and rounds for 24 hours (at most
+2,000 mappings per credential). A shared 60-second per-repository refresh/backoff
+also applies to missing threads and failed scans, so successive reviews of different
+missing PRs do not repeat the same lookup. A new thread may therefore wait up to
+60 seconds for discovery on a later review. An HTTP 404 on the PUT evicts that
+PR's ID and clears its repository's refresh backoff for the next review; it never
+triggers an immediate rescan or write retry. Other write failures retain the ID,
+but do not count as successful mutes.
+
+The cache uses credential-specific sibling files named
+`<identity-cache-file>.notifications-<SHA-256-fingerprint>.json`, derived from
+`TAUCETI_GITHUB_IDENTITY_CACHE`, which is anchored before HOME isolation. The
+fingerprint includes the personal credential and host; tokens and mute outcomes
+are never persisted. Each file has a process lock covering lookup and write to
+prevent cold-cache stampedes. Directory mode is 0700 and files are 0600; unsafe
+files/links are rejected and updates are atomic. Setting the identity-cache
+variable to `off` disables this cache too. Non-github.com hosts, unavailable
+credentials, or unavailable/unsafe storage fall back to the original bounded
+personal operation; corrupt records are discarded. No App credential is used.
 
 The response must contain the boolean `ignored:true` before success is logged.
 HTTP success with `ignored:false` is a failure, not evidence of a mute. This

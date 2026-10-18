@@ -71,6 +71,7 @@ RUN_STDLIB=(
   github_comments_batch.py
   github_review_comments_batch.py
   github_identity.py
+  github_notifications.py
   github_ratelimit.py
   github_shared_transport.py
   github_cli_metadata.py

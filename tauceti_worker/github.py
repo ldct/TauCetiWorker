@@ -36,6 +36,7 @@ from .constants import (
 from .github_comments import fetch_issue_comments
 from .github_identity import CACHE_ENV as IDENTITY_CACHE_ENV
 from .github_identity import cached_personal_login
+from .github_notifications import notification_threads, valid_thread_id
 from .github_review_comments import fetch_review_comments
 from .review_diagnostics import public_diagnostic_quality
 
@@ -716,7 +717,7 @@ class GitHub:
     def ignore_pr_notifications(self, pr: int) -> bool:
         """Best-effort personal REST thread mute after a successful review.
 
-        Scan at most three repository notification pages, stopping at the matching PR.
+        Reuse shared thread IDs, or scan at most three repository notification pages.
         Never retry a write, scan all history, or invalidate an already-posted review.
         HTTP success alone is insufficient: GitHub must confirm ignored=true.
         """
@@ -728,74 +729,98 @@ class GitHub:
             )
             return False
 
-        suffix = f"/repos/{self.repo}/pulls/{pr}"
-        thread_id = None
-        for page in range(1, 4):
+        with notification_threads() as cache:
+            thread_id = cache.get(self.repo, pr)
+            if thread_id is None and cache.can_refresh(self.repo):
+                # Populate every valid PR on each page, including entries after
+                # our target, so reviews of different PRs can reuse this scan.
+                subject_path = re.compile(r"/repos/" + re.escape(self.repo) + r"/pulls/([0-9]{1,20})/?$", re.I)
+                try:
+                    for page in range(1, 4):
+                        try:
+                            listed = self._gh(
+                                [
+                                    "api",
+                                    "--method",
+                                    "GET",
+                                    f"/repos/{self.repo}/notifications?all=true&per_page=100&page={page}",
+                                ]
+                            )
+                        except Exception:
+                            return failed("unexpected notification lookup failure")
+                        if listed.returncode != 0:
+                            return failed(
+                                "notification lookup: " + (listed.stderr or "") + "\n" + (listed.stdout or "")
+                            )
+                        try:
+                            threads = json.loads(listed.stdout or "null")
+                        except (ValueError, TypeError):
+                            return failed("GitHub returned invalid notification JSON")
+                        if not isinstance(threads, list):
+                            return failed("GitHub returned an invalid notification list")
+                        invalid_target = False
+                        for thread in threads:
+                            if not isinstance(thread, dict):
+                                continue
+                            subject = thread.get("subject")
+                            if not (
+                                isinstance(subject, dict)
+                                and subject.get("type") == "PullRequest"
+                                and isinstance(subject.get("url"), str)
+                            ):
+                                continue
+                            match = subject_path.search(subject["url"])
+                            if not match:
+                                continue
+                            number = int(match[1])
+                            candidate = thread.get("id")
+                            # Only decimal IDs may become URL path components.
+                            if not valid_thread_id(candidate):
+                                invalid_target |= number == pr
+                                continue
+                            cache.remember(self.repo, number, str(candidate))
+                        if invalid_target:
+                            return failed("GitHub returned an invalid notification thread ID")
+                        thread_id = cache.get(self.repo, pr)
+                        if thread_id or len(threads) < 100:
+                            break
+                finally:
+                    cache.mark_refreshed(self.repo)
+            if not thread_id:
+                return failed(
+                    "no matching PR notification thread in bounded lookup "
+                    "(at most 300 notifications; shared refresh at most once per 60s)"
+                )
+
             try:
-                listed = self._gh(
+                # Always PUT, even after a prior successful mute: each posted
+                # review can re-subscribe us. Bypass ALL gh_run write retries.
+                muted = run(
                     [
+                        "gh",
                         "api",
                         "--method",
-                        "GET",
-                        f"/repos/{self.repo}/notifications?all=true&per_page=100&page={page}",
+                        "PUT",
+                        f"/notifications/threads/{thread_id}/subscription",
+                        "-F",
+                        "ignored=true",
                     ]
                 )
             except Exception:
-                return failed("unexpected notification lookup failure")
-            if listed.returncode != 0:
-                return failed("notification lookup: " + (listed.stderr or "") + "\n" + (listed.stdout or ""))
+                return failed("unexpected subscription write failure")
+            if muted.returncode != 0:
+                detail = (muted.stderr or "") + "\n" + (muted.stdout or "")
+                if re.search(r"\bHTTP\s+404\b", detail, re.I):
+                    cache.evict(self.repo, pr)  # rediscover next review, never replay now
+                return failed("subscription write: " + detail)
             try:
-                threads = json.loads(listed.stdout or "null")
+                subscription = json.loads(muted.stdout or "null")
+                if not isinstance(subscription, dict) or subscription.get("ignored") is not True:
+                    return failed("GitHub did not confirm ignored=true for the notification thread")
             except (ValueError, TypeError):
-                return failed("GitHub returned invalid notification JSON")
-            if not isinstance(threads, list):
-                return failed("GitHub returned an invalid notification list")
-            for thread in threads:
-                if not isinstance(thread, dict):
-                    continue
-                subject = thread.get("subject")
-                if (
-                    isinstance(subject, dict)
-                    and subject.get("type") == "PullRequest"
-                    and isinstance(subject.get("url"), str)
-                    and subject["url"].rstrip("/").endswith(suffix)
-                ):
-                    candidate = thread.get("id")
-                    # Only decimal IDs may become URL path components.
-                    if not isinstance(candidate, (str, int)) or not re.fullmatch(r"[0-9]+", str(candidate)):
-                        return failed("GitHub returned an invalid notification thread ID")
-                    thread_id = str(candidate)
-                    break
-            if thread_id or len(threads) < 100:
-                break
-        if not thread_id:
-            return failed("no matching PR notification thread in bounded lookup (at most 300 notifications)")
-
-        try:
-            # Bypass gh_run's retries, including secondary-limit write retries.
-            muted = run(
-                [
-                    "gh",
-                    "api",
-                    "--method",
-                    "PUT",
-                    f"/notifications/threads/{thread_id}/subscription",
-                    "-F",
-                    "ignored=true",
-                ]
-            )
-        except Exception:
-            return failed("unexpected subscription write failure")
-        if muted.returncode != 0:
-            return failed("subscription write: " + (muted.stderr or "") + "\n" + (muted.stdout or ""))
-        try:
-            subscription = json.loads(muted.stdout or "null")
-            if not isinstance(subscription, dict) or subscription.get("ignored") is not True:
-                return failed("GitHub did not confirm ignored=true for the notification thread")
-        except (ValueError, TypeError):
-            return failed("GitHub returned invalid subscription JSON")
-        log(f"  review #{pr}: disabled notifications for the authenticated account (thread {thread_id})")
-        return True
+                return failed("GitHub returned invalid subscription JSON")
+            log(f"  review #{pr}: disabled notifications for the authenticated account (thread {thread_id})")
+            return True
 
     def open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
         from .github_state import read
