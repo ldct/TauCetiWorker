@@ -595,5 +595,12 @@ def resolve_work_model(
     if chosen is None and claude_pending_init(snap):
         return "claude", True
     if chosen is None:
-        raise NoProgress(f"no model under pace right now (agent={agent}) — nothing to run this round")
+        # Name the actual block: "under pace" alone reads as a spend limit even when the real reason is an
+        # unreadable quota (e.g. a rate-limited usage endpoint) that will clear on its own.
+        prov = snap.get(agent) if agent else None
+        detail = ""
+        if prov is not None:
+            why = prov.error or _unavail_reason(prov)[1]
+            detail = f" ({why}{_retry_hint(prov)})"
+        raise NoProgress(f"no model under pace right now (agent={agent}){detail} — nothing to run this round")
     return chosen, False

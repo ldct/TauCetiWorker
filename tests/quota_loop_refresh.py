@@ -61,6 +61,7 @@ q = tc.Quota.__new__(tc.Quota)
 q.cache_dir = Path(tempfile.mkdtemp(prefix="tauceti-quota-stub-"))
 q._cached_claude = lambda _fp: (payload, time.time())
 q._idle_notes = lambda _readings: ({}, False)
+q._usage_backoff_remaining = lambda: None  # no shared 429 back-off in force
 stores = []
 q._store_raw = lambda *args: stores.append(args)
 http_calls = []

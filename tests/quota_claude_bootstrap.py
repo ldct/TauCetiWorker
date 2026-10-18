@@ -517,5 +517,34 @@ before = len(list(Path(tempfile.gettempdir()).glob("tauceti-quota-bootstrap-*"))
 q._claude_bootstrap_request()
 check("the temp cwd is cleaned up", len(list(Path(tempfile.gettempdir()).glob("tauceti-quota-bootstrap-*"))), before)
 
+
+# --- a 429 is honoured across workers (shared Retry-After marker) ----------------------------------
+home = make_home()
+ep = Endpoint({}, code=429, retry_after=340.0)
+tc.quota._http_get_json = ep
+p1 = make_quota(home, "w1").claude()
+check("429 is reported with its Retry-After", (p1.available, p1.retry_after), (False, 340.0))
+p2 = make_quota(home, "w2").claude()
+check("another worker on the account does not re-call the endpoint", ep.calls, 1)
+check("...and reports the remaining wait", (p2.available, 330 < (p2.retry_after or 0) <= 340), (False, True))
+check("...with a named reason", "rate-limited" in (p2.error or ""), True)
+make_quota(home, "w3").claude(refresh=True)
+check("a forced refresh honours the back-off too", ep.calls, 1)
+q = make_quota(home, "w1")
+q._usage_backoff_path().write_text(tc.json.dumps({"until": time.time() - 1}))
+ok = Endpoint(active())
+tc.quota._http_get_json = ok
+check("once the back-off lapses the endpoint is read again", (q.claude().available, ok.calls), (True, 1))
+home = make_home()
+ep = Endpoint({}, code=429, retry_after=None)
+tc.quota._http_get_json = ep
+p = make_quota(home, "w1").claude()
+check("a 429 without Retry-After backs off by the default", p.retry_after, tc.quota.CLAUDE_USAGE_BACKOFF_DEFAULT_S)
+q = make_quota(home, "w2")
+q._usage_backoff_path().write_text(tc.json.dumps({"until": time.time() + 10 * 86400}))
+check("a far-future marker is clamped", q._usage_backoff_remaining() <= tc.quota.CLAUDE_USAGE_BACKOFF_MAX_S, True)
+q._usage_backoff_path().write_text("garbage")
+check("a corrupt marker is ignored", q._usage_backoff_remaining(), None)
+
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

@@ -117,6 +117,16 @@ CLAUDE_BOOTSTRAP_FILE = "bootstrap.json"
 # measuring this account contends for the same file, whatever its worker id or checkout.
 CLAUDE_QUOTA_DIRNAME = ".tauceti-quota"
 
+# A 429 from the usage endpoint is remembered beside the bootstrap ledger, so every worker measuring the
+# account honours the endpoint's Retry-After. Under the manager each round is its own process that
+# exits and is relaunched about a minute later; an in-process back-off never applies there, and N idle
+# workers each polling once a minute keep the endpoint rate-limited indefinitely.
+CLAUDE_USAGE_BACKOFF_FILE = "usage-backoff.json"
+# When a 429 carries no usable Retry-After, back off this long rather than retrying on the next poll.
+CLAUDE_USAGE_BACKOFF_DEFAULT_S = 300.0
+# A marker can never hold the fleet off longer than this (a corrupt or far-future marker must not wedge it).
+CLAUDE_USAGE_BACKOFF_MAX_S = 3600.0
+
 # Environment the bootstrap request must NOT inherit. Every one of these can route a `claude -p` turn
 # to different credentials or a different backend than the one whose quota we just measured — an API
 # key, a second OAuth token, a proxy, or Bedrock/Vertex/Foundry — which would make the request bill
@@ -1908,6 +1918,12 @@ class Quota:
             return self._cooling_provider("claude", left, cooled_by), None
         if not tok:
             return Provider("claude", False, None, error="no claude accessToken"), None
+        # Honour a 429 recorded by any worker on this account: no request until its Retry-After lapses.
+        # This applies to forced refreshes too — re-reading early is exactly what keeps the limit alive.
+        wait = self._usage_backoff_remaining()
+        if wait is not None:
+            err = "claude usage HTTP 429 (usage endpoint rate-limited; honouring Retry-After)"
+            return Provider("claude", False, None, error=err, retry_after=wait), None
         headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA, "User-Agent": "claude-code/2.1"}
         try:
             code, payload, retry_after = _http_get_json(CLAUDE_USAGE_URL, headers)
@@ -1936,6 +1952,7 @@ class Quota:
                 err += " (access token expired or rejected; log in again)"
             elif code == 429:
                 err += " (usage endpoint rate-limited)"
+                retry_after = self._record_usage_backoff(retry_after)
             elif code == 200:
                 err = "claude usage response empty"
             return Provider("claude", False, None, error=err, retry_after=retry_after, rate_limited=code == 429), None
@@ -2133,6 +2150,37 @@ class Quota:
         sequence allows."""
         period = int(time.time() // _WINDOW_S[window])
         return f"{self._claude_account_key()}|{window}|{period}"
+
+    def _usage_backoff_path(self) -> Path:
+        return self._claude_creds_source() / CLAUDE_QUOTA_DIRNAME / CLAUDE_USAGE_BACKOFF_FILE
+
+    def _usage_backoff_remaining(self) -> float | None:
+        """Seconds left on a shared usage-endpoint back-off, or None when there is none in force."""
+        d = _read_json_file(self._usage_backoff_path())
+        until = d.get("until") if isinstance(d, dict) else None
+        if not _finite_num(until):
+            return None
+        left = until - time.time()
+        return min(left, CLAUDE_USAGE_BACKOFF_MAX_S) if left > 0 else None
+
+    def _record_usage_backoff(self, retry_after: float | None) -> float:
+        """Record a 429 for every worker on this account and return the wait in force. A missing or zero
+        Retry-After falls back to the default; an existing longer back-off is never shortened. Failing to
+        write the marker is not fatal: this worker still reports the wait it was given."""
+        secs = retry_after if _finite_num(retry_after) and retry_after > 0 else CLAUDE_USAGE_BACKOFF_DEFAULT_S
+        secs = min(secs, CLAUDE_USAGE_BACKOFF_MAX_S)
+        current = self._usage_backoff_remaining()
+        if current is not None and current >= secs:
+            return current
+        path = self._usage_backoff_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"until": time.time() + secs, "retry_after": secs}))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        return secs
 
     def _bootstrap_paths(self) -> tuple[Path, Path]:
         """(ledger, lock) for the shared reservation."""
