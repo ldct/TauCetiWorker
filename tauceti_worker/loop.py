@@ -542,6 +542,11 @@ def claude_pending_init(snap: dict) -> bool:
     return bool(prov and prov.bootstrap_eligible)
 
 
+def skip_pacing() -> bool:
+    """$TAUCETI_SKIP_PACING=1: skip the local quota/pace check entirely for an explicit claude/codex agent."""
+    return os.environ.get("TAUCETI_SKIP_PACING", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def resolve_work_model(
     cfg: Config, agent: str, *, dry: bool, ignore_quota: bool, quota_cmd: str | None = None, fresh: bool = False
 ) -> tuple[str, bool]:
@@ -562,6 +567,11 @@ def resolve_work_model(
     if dry:
         return agent, False
     if agent in OPENROUTER_MODELS or agent == "kiro":
+        return agent, False
+    if skip_pacing() and agent in ("claude", "codex"):
+        # Operator opt-out: launch the pinned agent without reading usage at all. Nothing local paces
+        # or guards the spend; the provider's own limits are the only stop.
+        log(f"quota: pacing skipped ($TAUCETI_SKIP_PACING) — launching {agent} without a usage read")
         return agent, False
     if ignore_quota and not quota_cmd and agent == "auto":
         raise SystemExit(

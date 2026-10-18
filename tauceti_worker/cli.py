@@ -154,6 +154,7 @@ environment (flags win; full reference linked below):
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
+  TAUCETI_SKIP_PACING    1 = skip the quota/pace check for an explicit claude/codex agent
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
   TAUCETI_QUOTA_RESERVE  minimum quota left before launches stop (default = 10)
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile

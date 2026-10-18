@@ -131,6 +131,7 @@ RUN_STDLIB=(
   quota_codex_windows.py
   quota_reason.py
   quota_reserve.py
+  skip_pacing.py
   review_codex_model.py
   review_mathlib_source.py
   review_diagnostics.py
