@@ -74,6 +74,7 @@ from .constants import (
     REVIEW,
     REVIEW_AFFINITY_GRACE_S,
     REVIEW_PROVIDER_DOWN_EXIT,
+    REVIEW_SOURCE,
     ROADMAP,
     ROUND_TIMEOUT,
     SANDBOX_DEFAULT,
@@ -1282,8 +1283,13 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 [
                     "uvx",
                     "--from",
-                    f"git+https://github.com/{REVIEW}"
-                    + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
+                    # TAUCETI_REVIEW_REF pins the default GitHub source; an explicit source is used verbatim.
+                    REVIEW_SOURCE
+                    + (
+                        "@" + os.environ["TAUCETI_REVIEW_REF"]
+                        if os.environ.get("TAUCETI_REVIEW_REF") and REVIEW_SOURCE == f"git+https://github.com/{REVIEW}"
+                        else ""
+                    ),
                     "tauceti-review",
                     str(pr),
                     "--store",

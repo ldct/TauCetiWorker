@@ -63,6 +63,9 @@ PROGRESS_ERROR_KEY = f"progress-err-{_PROGRESS_ERROR_REF}"
 # A full uv source URL permits a pinned, locally audited checkout during an emergency repair without
 # editing a disposable uvx environment. Production normally leaves this unset and uses GitHub.
 PROGRESS_SOURCE = os.environ.get("TAUCETI_PROGRESS_SOURCE", f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}")
+# Same escape hatch for the review engine (e.g. `git+file:///home/me/TauCetiReview@<branch>`), so an
+# engine fix can run on this host before it is merged upstream. Unset: TauCetiReview's main on GitHub.
+REVIEW_SOURCE = os.environ.get("TAUCETI_REVIEW_SOURCE") or f"git+https://github.com/{REVIEW}"
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
