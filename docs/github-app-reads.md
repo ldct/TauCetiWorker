@@ -165,15 +165,22 @@ cache failure falls back to the personal lookup. Non-github.com hosts bypass thi
 cache. Set the variable to `off` to disable persistent caching. Enabling it does
 not inject GitHub credentials into the review engine's tokenless model environment.
 
-## Constant-cost post-review notification muting
+## Bounded REST post-review notification muting
 
-After a successful review, the Worker obtains the public PR node ID and makes
-one personal GraphQL `updateSubscription` mutation with state `IGNORED`. This
-replaces the former unbounded, paginated traversal of the user's entire repository
-notification history. The read is App-eligible; the mutation always stays personal,
-is not automatically retried, and must explicitly confirm the same PR's ignored
-subscription. Muting remains best-effort: failure never invalidates an already
-posted review or skips archive processing.
+After a successful review, the Worker searches up to three pages of 100 repository
+notifications (`all=true`, including read notifications), stopping when it finds
+that PR's thread. It then makes one REST subscription PUT with `ignored=true`.
+Both lookup and write stay personal; this path makes no GraphQL calls. Read
+requests retain normal transient retries, but the write is never retried.
+Missing threads or threads outside the first 300 entries are logged as failures;
+there is no unbounded history scan or GraphQL fallback.
+
+The response must contain the boolean `ignored:true` before success is logged.
+HTTP success with `ignored:false` is a failure, not evidence of a mute. This
+REST fallback replaces GraphQL IGNORED updates after live tests returned
+UNSUBSCRIBED instead. REST also returned ignored:false in live samples, so the
+fallback is not a proven fix for GitHub's behavior. Muting remains best-effort:
+failure never invalidates or replays an already-posted review.
 
 The loop's personal-budget preflight remains enabled: it still needs personal
 quota for contributions and non-routed calls. An exhausted personal budget must
