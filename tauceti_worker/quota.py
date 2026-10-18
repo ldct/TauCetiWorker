@@ -1920,8 +1920,12 @@ class Quota:
             return Provider("claude", False, None, error="no claude accessToken"), None
         # Honour a 429 recorded by any worker on this account: no request until its Retry-After lapses.
         # This applies to forced refreshes too — re-reading early is exactly what keeps the limit alive.
+        # Like a live 429 below, a still-valid cached reading answers in its place.
         wait = self._usage_backoff_remaining()
         if wait is not None:
+            still = self._cached_claude(fp)
+            if still is not None:
+                return self._from_cached_claude(still)
             err = "claude usage HTTP 429 (usage endpoint rate-limited; honouring Retry-After)"
             return Provider("claude", False, None, error=err, retry_after=wait), None
         headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA, "User-Agent": "claude-code/2.1"}
