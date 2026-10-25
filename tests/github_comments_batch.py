@@ -338,8 +338,8 @@ class SurveyTests(unittest.TestCase):
             sv = self.survey()
             self.assertEqual(len(self.gh.requests), 4)
             self.assertEqual(self.gh.rest, [], "long prefetch must not expire into REST re-reads")
-            self.assertEqual([c.pr for c in sv.reviewable.actionable], [1, *range(4, 41)])
-            self.assertEqual(sv.review_inflight, [(2, "codex")])
+            # Upstream no longer reads in-progress markers for selection: held PR 2 stays actionable.
+            self.assertEqual([c.pr for c in sv.reviewable.actionable], [1, 2, *range(4, 41)])
             self.assertEqual(self.gh.review, [3])
             self.assertEqual(self.rs._survey_comments, {})
             self.survey()
@@ -352,21 +352,20 @@ class SurveyTests(unittest.TestCase):
             self.assertEqual(len(self.gh.requests), 5)
             variables = fields(self.gh.requests[-1])
             self.assertEqual([variables["pr0"], variables["pr1"]], ["1", "4"])
-            self.assertEqual([pr for pr, _ in sv.review_inflight], [1, 2])
+            self.assertIn(1, [c.pr for c in sv.reviewable.actionable])
             self.assertEqual(self.gh.rest, [])
             self.gh.clocks[5] = "2026-09-26T00:01:00Z"
             self.survey(deep=False)
             self.assertEqual(len(self.gh.requests), 5)
 
-    def test_late_scoreboard_and_marker_are_not_lost(self):
+    def test_late_scoreboard_is_not_lost(self):
         self.gh.count = 2
         self.gh.comments = {
             1: [board("old", "2026-09-25T00:00:00Z")] + [comment()] * 99 + [board("head1")],
             2: [comment()] * 100 + [held("head2")],
         }
         sv = self.survey()
-        self.assertEqual(sv.reviewable.actionable, [])
-        self.assertEqual(sv.review_inflight, [(2, "codex")])
+        self.assertEqual([c.pr for c in sv.reviewable.actionable], [2])
         self.assertEqual(self.rs.gh_meta(1).data["head_sha"], "head1")
         self.assertEqual(len(self.gh.requests), 2)
         self.assertEqual(self.gh.rest, [])
@@ -379,7 +378,7 @@ class SurveyTests(unittest.TestCase):
             self.assertEqual(self.rs.gh_meta(1, force=True).data["head_sha"], "new")
             self.assertEqual(self.gh.rest, [1])
             self.assertEqual(self.rs._survey_comments, {})
-            self.assertEqual(self.rs.inflight_review(1, "old", force=True), set())
+            self.assertEqual(self.rs.gh_meta(1, force=True).data["head_sha"], "new")
             self.assertEqual(self.gh.rest, [1, 1])
         self.rs.bust(1)
         with self.rs.survey_comments([1]):
@@ -404,16 +403,16 @@ class SurveyTests(unittest.TestCase):
             self.assertEqual(self.rs.gh_meta(1).provenance, "stale")
             self.assertEqual(self.rs.gh_meta(1).data["head_sha"], "old")
             self.assertEqual(self.rs.gh_meta(2).provenance, "fetch_failed")
-            self.assertEqual(self.rs.inflight_review(2, "head2"), set())
+            self.assertEqual(self.rs.gh_meta(2).provenance, "fetch_failed")
             self.assertEqual(self.gh.rest, [])
         self.assertEqual((self.cfg.sbcache / "1.key.json").read_text(), previous)
         self.assertFalse((self.cfg.sbcache / "2.key.json").exists())
 
-    def test_forced_marker_bypasses_prefetch_and_failed_prefetch_is_not_sticky(self):
-        self.gh.comments[1] = [held("head1")]
+    def test_forced_read_bypasses_prefetch_and_failed_prefetch_is_not_sticky(self):
+        self.gh.comments[1] = [board("head1")]
         with self.rs.survey_comments([1]):
-            self.gh.comments[1] = []
-            self.assertEqual(self.rs.inflight_review(1, "head1", force=True), set())
+            self.gh.comments[1] = [board("head2")]
+            self.assertEqual(self.rs.gh_meta(1, force=True).data["head_sha"], "head2")
             self.assertEqual(self.rs._survey_comments, {})
         self.assertEqual(self.gh.rest, [1])
         self.rs.bust(1)

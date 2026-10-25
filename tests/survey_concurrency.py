@@ -87,7 +87,6 @@ def run(workers, deep=True):
             patch.object(survey_module, "SURVEY_WORKERS", workers),
             patch.object(survey_module, "me", return_value="me"),
             patch.object(survey_module, "progress_due", return_value=(True, "due")),
-            patch.object(survey_module, "_review_rounds_today", side_effect=lambda _, n: 100 if n == 11 else 0),
         ):
             rs = tc.ReviewState(cfg, gh)
             sv = tc.survey(cfg, gh, rs, counters, deep=deep, progress=report)
@@ -104,7 +103,8 @@ def run(workers, deep=True):
                 gh.forced_holds.add(1)
                 changed = tc.survey(cfg, gh, rs, counters, deep=deep)
                 assert gh.calls == first_calls + Counter({1: 1})
-                assert [n for n, _ in changed.review_inflight] == [1, 2, 6, 10]
+                # In-progress markers no longer gate selection upstream; only the refetch matters.
+                assert 1 in [c.pr for c in changed.reviewable.actionable]
                 gh.calls = first_calls  # retain the first-pass comparison below
         return sv, gh, messages
 
@@ -112,10 +112,9 @@ def run(workers, deep=True):
 serial, serial_gh, _ = run(1)
 parallel, parallel_gh, progress = run(6)
 assert dataclasses.asdict(serial) == dataclasses.asdict(parallel)
-assert [c.pr for c in parallel.reviewable.actionable] == [1, 3, 4, 5, 8, 9, 12]
+# Upstream dropped the daily review cap and in-progress hold markers: only the stuck PR is excluded.
+assert [c.pr for c in parallel.reviewable.actionable] == [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12]
 assert parallel.review_stuck == [7]
-assert [n for n, _ in parallel.review_capped] == [11]
-assert [n for n, _ in parallel.review_inflight] == [2, 6, 10]
 assert 1 < parallel_gh.peak <= 6 and serial_gh.peak == 1
 assert serial_gh.calls == parallel_gh.calls == Counter(range(1, 13)), "one issue fetch per PR"
 assert "Checking PR reviews: 12/12" in progress

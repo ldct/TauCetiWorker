@@ -133,7 +133,6 @@ with tempfile.TemporaryDirectory() as tmp:
         patch.object(survey_module, "_survey_review", side_effect=audited_review),
         patch.object(survey_module, "me", return_value="me"),
         patch.object(survey_module, "progress_due", return_value=(False, "not due")),
-        patch.object(survey_module, "_review_rounds_today", return_value=0),
     ):
         cold = survey()
         gh.read_barrier = write_barrier = None

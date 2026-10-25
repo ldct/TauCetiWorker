@@ -226,7 +226,7 @@ def test_review_lifecycle():
     saved = {name: getattr(wu, name) for name in ("run_to_logfile", "review_in_bubble", "me", "log")}
     logs = []
     wu.run_to_logfile = lambda *args: 0
-    wu.review_in_bubble = lambda *args: 0
+    wu.review_in_bubble = lambda *args, **kwargs: 0
     wu.me = lambda: "authenticated-login"
     wu.log = logs.append
     candidate = types.SimpleNamespace(pr=42, head="a" * 40, contest=None, contest_reply_id=None)

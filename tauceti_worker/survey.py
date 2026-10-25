@@ -382,9 +382,11 @@ class Survey:
             if automatic is not None
             else roadmap_open_count(self._mine_open_prs, self.roadmap_only, self.roadmap_skip)
         )
-        # Auto resolves its concrete candidates in do_roadmap; an aggregate count must
-        # not prevent it from looking for an area with capacity.
-        self.roadmap_backpressure = self.roadmap_only != "auto" and self.n_mine_open >= self.max_open_prs
+        # Auto applies the limit per area when every open PR of ours is known (see
+        # work_units.auto_roadmap_areas); an aggregate count must not prevent it from
+        # looking for an area with capacity. Partial shared-service rows keep the aggregate.
+        per_area = self.roadmap_only == "auto" and getattr(self, "_auto_mine_open", ()) is not None
+        self.roadmap_backpressure = not per_area and self.n_mine_open >= self.max_open_prs
         self.next_auto_stage = _next_auto_stage(self)
 
     def status_label_line(self) -> str:
@@ -885,6 +887,11 @@ def survey(
                 [p for p in all_prs if not p.is_draft and p.author == me()], "auto", sv.roadmap_skip
             )
         )
+        # Per-area automatic backpressure needs every open PR of ours. The shared service's rows can
+        # be partial and only carry an aggregate count; then keep the aggregate limit (None).
+        sv._auto_mine_open = (
+            None if available and counts is not None else [p for p in all_prs if not p.is_draft and p.author == me()]
+        )
     if deep:
         prs = [
             p
@@ -1047,7 +1054,7 @@ def survey(
     # before starting per-PR readers. Snapshots never escape this review phase.
     with (
         rs.survey_comments([p.number for p in review_prs], heads={p.number: p.head_oid for p in review_prs})
-        if deep and not cached_only
+        if deep and not cached_only and hasattr(rs, "survey_comments")
         else nullcontext(),
         ThreadPoolExecutor(max_workers=SURVEY_WORKERS, thread_name_prefix="survey") as pool,
     ):

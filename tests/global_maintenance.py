@@ -405,6 +405,29 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round([row(10, "Other", complete=False)])
         self.assertEqual(self.calls[0][:2], ("review", 10))
 
+    def test_complete_inventory_applies_automatic_backpressure_per_area(self):
+        # Fork behaviour: with every open PR of ours known, auto authoring skips only capped areas.
+        self.w.gh.open_prs = lambda: [row(10, "Full")["pr"]]
+        for areas, expected in ((["Full", "Free"], "Free"), (["Full"], None)):
+            self.calls = []
+
+            def perform(stage, _w, sv, candidate, _opts):
+                self.calls.append((stage, sv.roadmap_only))
+                return 0 if stage == "roadmap" else None
+
+            with (
+                patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="1"),
+                patch("tauceti_worker.github_state.read_survey", return_value=(False, None)),
+                patch.object(work, "dispatch", side_effect=perform),
+                patch.object(work, "roadmap_areas", return_value=areas),
+            ):
+                if expected is None:
+                    with self.assertRaisesRegex(NoProgress, "all 1 eligible areas"):
+                        run_round(self.w, self.opts)
+                else:
+                    run_round(self.w, self.opts)
+            self.assertEqual([c for c in self.calls if c[0] == "roadmap"], [("roadmap", expected)] if expected else [])
+
     def test_partial_history_does_not_bypass_authoring_limit(self):
         with patch.dict(os.environ, TAUCETI_MAX_OPEN_PRS="1"):
             with self.assertRaisesRegex(NoProgress, "backpressure"):

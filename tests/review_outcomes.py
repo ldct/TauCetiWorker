@@ -44,7 +44,6 @@ def drive(directory, result, *, bubble=False):
         patch.object(wu, "run_to_logfile", side_effect=engine),
         patch.object(wu, "review_in_bubble", side_effect=engine),
         patch.object(wu, "me", return_value="tester"),
-        patch.object(wu, "_sync_review_outbox", side_effect=lambda *_: synced.append(True) or 0),
         patch.object(activity, "emit", side_effect=lambda kind, **kw: events.append((kind, kw))),
     ):
         round = Round("w")
@@ -64,7 +63,8 @@ with tempfile.TemporaryDirectory() as tmp:
         assert finish["round_type"] == "no-work" and finish["outcome"] != "completed"
     for result in ({"head_sha": HEAD, "changed": True}, {"head_sha": "other", "changed": False}, None, []):
         rc, values, busted, synced, _ = drive(directory, result)
-        assert rc == 0 and values["review-err-42"] == 0 and synced and busted == [42]
+        # This fork runs the engine with --no-archive, so no outbox sync follows a real outcome.
+        assert rc == 0 and values["review-err-42"] == 0 and not synced and busted == [42]
     # The real host launcher passes the same path to the engine, including streaming mode.
     with (
         patch.object(agents, "run_process", return_value=SimpleNamespace(returncode=0)) as run,

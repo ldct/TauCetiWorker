@@ -128,7 +128,6 @@ agents._review_mathlib_source = lambda cfg, head: None
 # --- host: exercise the actual do_review command construction without a provider/network ----------
 host_commands = []
 work_units.run_to_logfile = lambda argv, *_: host_commands.append(argv) or 0
-work_units._sync_review_outbox = lambda *_: 0
 work_units.clear_review_failure = lambda *_: None
 work_units.me = lambda: "tester"
 w.cfg.logdir = tmp

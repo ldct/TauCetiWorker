@@ -46,6 +46,26 @@ class Meta:
     provenance: str
 
 
+def _clean_head(meta: dict) -> str:
+    if meta.get("mode") == "init":
+        return ""
+    states = meta.get("states") or {}
+    if states:
+        # Carried verdicts can complete a head without generating any new runs.
+        completed = {"green", "blocking_request", "blocking_block"}
+        # Adverse findings defer stale approvals; a block also defers absent rubrics.
+        allowed = completed | (
+            {"stale"} if any(v in ("blocking_request", "blocking_block") for v in states.values()) else set()
+        )
+        if "blocking_block" in states.values():
+            allowed.add("absent")
+        return str(meta.get("head_sha") or "") if all(v in allowed for v in states.values()) else ""
+    runs = meta.get("runs") or []
+    if runs and all(r.get("verdict") != "error" for r in runs):
+        return str(meta.get("head_sha") or "")
+    return ""
+
+
 class ReviewState:
     """One survey/round's caches, with concurrency partitioned by PR.
 
@@ -195,7 +215,7 @@ class ReviewState:
                         continue
                     # Inspect the same scoreboard as the review predicate, without
                     # pre-writing its cache or changing author-phase freshness.
-                    if self._clean_head(self._survey_meta(pr)) == heads.get(pr):
+                    if _clean_head(self._survey_meta(pr)) == heads.get(pr):
                         needed.append(pr)
                 if needed:
                     fetched = inline_batch(needed)
@@ -342,27 +362,7 @@ class ReviewState:
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
-        return self._clean_head(self.gh_meta(pr).data)
-
-    @staticmethod
-    def _clean_head(meta: dict) -> str:
-        if meta.get("mode") == "init":
-            return ""
-        states = meta.get("states") or {}
-        if states:
-            # Carried verdicts can complete a head without generating any new runs.
-            completed = {"green", "blocking_request", "blocking_block"}
-            # Adverse findings defer stale approvals; a block also defers absent rubrics.
-            allowed = completed | (
-                {"stale"} if any(v in ("blocking_request", "blocking_block") for v in states.values()) else set()
-            )
-            if "blocking_block" in states.values():
-                allowed.add("absent")
-            return str(meta.get("head_sha") or "") if all(v in allowed for v in states.values()) else ""
-        runs = meta.get("runs") or []
-        if runs and all(r.get("verdict") != "error" for r in runs):
-            return str(meta.get("head_sha") or "")
-        return ""
+        return _clean_head(self.gh_meta(pr).data)
 
     def review_rounds(self, pr: int, counters: Counters) -> int:
         # Prefer full_rounds (full review passes; excludes reply/contest rounds) so an author's

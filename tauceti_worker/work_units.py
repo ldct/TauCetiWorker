@@ -432,6 +432,26 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         raise NoProgress(f"{why} — aborting round, not falling through to authoring")
 
     log(f"open PRs: {sv.status_label_line()}")
+    # Automatic area selection applies backpressure per area (see auto_roadmap_areas). Resolve it
+    # lazily, only where authoring pressure matters, so maintenance rounds never list roadmap areas.
+    # A worker whose every eligible area is at the limit then behaves like one at the aggregate limit.
+    auto_areas = None
+
+    def resolve_auto_areas() -> None:
+        nonlocal auto_areas
+        if (
+            auto_areas is None
+            and not sv.roadmap_backpressure
+            and want(opts.only, "roadmap")
+            and not getattr(opts, "prs", ())
+            and scope in (None, "auto")
+            and getattr(sv, "roadmap_only", "auto") == "auto"
+            and not opts.dry_run
+        ):
+            auto_areas = auto_roadmap_areas(w, sv)
+            if not auto_areas.available:
+                sv.roadmap_backpressure = True
+
     # `--pr` scopes what this round SAYS as well as what it does. Every note below is about one named
     # PR, and pr_focus_reason repeats the ones that apply to a target anyway, so leaving them
     # unfiltered would bury the operator's answer under a report about PRs they did not ask about.
@@ -523,6 +543,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             except Die as exc:
                 log(f"  review: {exc}; reviewer affinity disabled for this round")
         ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
+        if deferred:
+            resolve_auto_areas()
         if sv.roadmap_backpressure and deferred:
             log("  review: authoring paused; previous-reviewer preference will not leave workers idle")
             ordered.extend(deferred)
@@ -577,16 +599,23 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
     if want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
+        resolve_auto_areas()
         if sv.roadmap_backpressure:
             if claim_collision:
                 raise ClaimCollision("authoring paused at the PR limit; available maintenance is claimed by peers")
+            if auto_areas is not None:
+                raise NoProgress(auto_areas.why)
             raise NoProgress(
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
                 f"(>= {sv.max_open_prs}) — backpressure, not authoring"
             )
         if global_pick:
             log("No available maintenance or reviews; proceeding to roadmap authoring")
-            if scope in (None, "auto") and not opts.dry_run:
+            if auto_areas is not None:
+                sv.roadmap_only = random.choice(auto_areas.available)
+                log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work; {auto_areas.summary})")
+            elif scope in (None, "auto") and not opts.dry_run:
+                # Aggregate-limited (partial shared rows): any non-skipped area, as upstream.
                 all_areas = roadmap_areas(w.gh)
                 areas = [area for area in all_areas if area not in roadmap_skip()]
                 sv.roadmap_only = random.choice(areas) if areas else ("auto" if all_areas else "any")
@@ -2572,30 +2601,45 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
         return None
 
 
+@dataclass(frozen=True)
+class AutoRoadmapAreas:
+    available: list[str]
+    why: str = ""
+    summary: str = ""
+
+
+def auto_roadmap_areas(w, sv, skip: list[str] | None = None) -> AutoRoadmapAreas:
+    """Areas automatic roadmap selection may author in: known, not skipped, and below the open-PR
+    limit counting only this contributor's open PRs in that area."""
+    from .survey import roadmap_open_count
+
+    skip = roadmap_skip() if skip is None else skip
+    raw_areas = roadmap_areas(w.gh)
+    if not raw_areas:
+        return AutoRoadmapAreas([], "roadmap: no areas available — cannot check per-area capacity")
+    areas = [a for a in raw_areas if a not in skip]
+    if not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
+        return AutoRoadmapAreas([], f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
+    mine = getattr(sv, "_auto_mine_open", None)
+    mine = getattr(sv, "_mine_open_prs", []) if mine is None else mine
+    available = [a for a in areas if roadmap_open_count(mine, a, []) < sv.max_open_prs]
+    return AutoRoadmapAreas(
+        available,
+        f"roadmap: all {len(areas)} eligible areas have >= {sv.max_open_prs} open PRs — backpressure, not authoring",
+        f"{len(available)} areas with capacity, {len(areas) - len(available)} at cap, skipping {len(skip)}",
+    )
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     os.environ["TAUCETI_VERIFY_POLICY"] = "ordinary"
     only = c.reason or "any"
     skip = roadmap_skip()
     if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
-        raw_areas = roadmap_areas(w.gh)
-        areas = [a for a in raw_areas if a not in skip]
-        if raw_areas and not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
-            raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
-        if not raw_areas:
-            raise NoProgress("roadmap: no areas available — cannot check per-area capacity")
-        from .survey import roadmap_open_count
-
-        available = [a for a in areas if roadmap_open_count(sv._mine_open_prs, a, []) < sv.max_open_prs]
-        if not available:
-            raise NoProgress(
-                f"roadmap: all {len(areas)} eligible areas have >= {sv.max_open_prs} open PRs "
-                "— backpressure, not authoring"
-            )
-        only = random.choice(available)
-        log(
-            f"→ ROADMAP area: {only} (auto-picked from {len(available)} areas with capacity, "
-            f"{len(areas) - len(available)} at cap, skipping {len(skip)})"
-        )
+        areas = auto_roadmap_areas(w, sv, skip)
+        if not areas.available:
+            raise NoProgress(areas.why)
+        only = random.choice(areas.available)
+        log(f"→ ROADMAP area: {only} (auto-picked; {areas.summary})")
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
         log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is

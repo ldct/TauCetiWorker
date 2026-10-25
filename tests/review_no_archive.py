@@ -163,8 +163,11 @@ def test_review_lifecycle(root, bubble, contest, historical):
             check(f"{label}: rubric contest counter", w.counters.read(f"review-contest-726-{contest}"), 1)
         if not bubble:
             argv = host_engine.call_args.args[0]
-            check(f"{label}: engine comes from the configured source", argv[:4],
-                  ["uvx", "--from", wu.REVIEW_SOURCE, "tauceti-review"])
+            check(
+                f"{label}: engine comes from the configured source",
+                argv[:4],
+                ["uvx", "--from", wu.REVIEW_SOURCE, "tauceti-review"],
+            )
             check(f"{label}: engine still posts", "--post" in argv, True)
             check(f"{label}: engine disables archive creation and uploads", "--no-archive" in argv, True)
             check(
@@ -186,9 +189,11 @@ def test_review_lifecycle(root, bubble, contest, historical):
         check(f"{label}: failed retry leaves historical outbox untouched", snapshot(outbox) == before, True)
 
 
-check("engine source defaults to TauCetiReview on GitHub",
-      wu.REVIEW_SOURCE if "TAUCETI_REVIEW_SOURCE" not in os.environ else "git+https://github.com/" + wu.REVIEW,
-      "git+https://github.com/" + wu.REVIEW)
+check(
+    "engine source defaults to TauCetiReview on GitHub",
+    wu.REVIEW_SOURCE if "TAUCETI_REVIEW_SOURCE" not in os.environ else "git+https://github.com/" + wu.REVIEW,
+    "git+https://github.com/" + wu.REVIEW,
+)
 saved_source = wu.REVIEW_SOURCE
 wu.REVIEW_SOURCE = "git+file:///srv/TauCetiReview@local-fix"
 try:

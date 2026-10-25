@@ -535,7 +535,8 @@ q._store_raw("claude", active(), FP, None, time.time())
 p = q.claude(refresh=True)
 check("during a back-off a forced refresh falls back to a valid cached reading", (p.available, ep.calls), (True, 1))
 q._forget_raw("claude")
-q = make_quota(home, "w1")
+# A fresh worker: w1-w3 also hold their own per-worker cooldown from the 429 above.
+q = make_quota(home, "w4")
 q._usage_backoff_path().write_text(tc.json.dumps({"until": time.time() - 1}))
 ok = Endpoint(active())
 tc.quota._http_get_json = ok

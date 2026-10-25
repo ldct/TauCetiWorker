@@ -444,6 +444,9 @@ def cooldown_quota(prefix):
     q = tc.Quota.__new__(tc.Quota)
     q.cache_dir = Path(tempfile.mkdtemp(prefix=f"tauceti-quota-{prefix}-"))
     q._idle_notes = lambda _readings: ({}, False)
+    # Isolate the per-account cooldown from the fork's cross-worker usage back-off marker.
+    q._usage_backoff_remaining = lambda: None
+    q._record_usage_backoff = lambda retry_after: retry_after
     return q
 
 

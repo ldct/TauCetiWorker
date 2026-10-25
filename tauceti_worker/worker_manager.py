@@ -530,9 +530,17 @@ def _toml_value(value) -> str:
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
     if isinstance(value, dict):
-        # An inline table, which is what `env` is. Written in sorted order so a rewrite of an
-        # unchanged definition is byte-identical.
-        return "{ " + ", ".join(_toml_value(k) + " = " + _toml_value(v) for k, v in sorted(value.items())) + " }"
+        # An inline table, which is what `env` is. Bare-safe keys (POSIX env names) stay bare;
+        # anything else is quoted. Written in sorted order so a rewrite of an unchanged definition
+        # is byte-identical.
+        return (
+            "{ "
+            + ", ".join(
+                (k if re.fullmatch(r"[A-Za-z0-9_-]+", k) else _toml_value(k)) + " = " + _toml_value(v)
+                for k, v in sorted(value.items())
+            )
+            + " }"
+        )
     raise WorkersError(f"cannot encode TOML value of type {type(value).__name__}")
 
 
