@@ -62,14 +62,34 @@ class FakeRS:
 
 
 class FakeGH:
-    """The PR itself as a live re-read sees it, plus the reaction claim on a contested reply."""
+    """The PR itself as a live re-read sees it, plus the reaction claim on a contested reply and how far
+    the head is behind main."""
 
-    def __init__(self, *, head=None, state="OPEN", draft=False, view=True, claim_age=None):
-        self.view = {"headRefOid": head or HEAD, "isDraft": draft, "state": state} if view else None
-        self.claim_age = claim_age
+    def __init__(
+        self, *, head=None, state="OPEN", draft=False, view=True, claim_age=None, mergeable="CONFLICTING", behind=5
+    ):
+        self.view = (
+            {
+                "headRefOid": head or HEAD,
+                "isDraft": draft,
+                "state": state,
+                "labels": [],
+                "mergeable": mergeable,
+                "baseRefName": "main",
+                "headRepositoryOwner": {"login": "o"},
+                "headRepository": {"name": "r"},
+            }
+            if view
+            else None
+        )
+        self.claim_age, self.behind, self.compared = claim_age, behind, []
 
     def pr_view(self, pr, fields):
         return self.view
+
+    def behind_main(self, owner, repo, head, base="main"):
+        self.compared.append((owner, repo, head, base))
+        return self.behind
 
     def fresh_claim_age(self, comment_id):
         return self.claim_age
@@ -223,6 +243,33 @@ for provenance in ("stale", "fetch_failed"):
             still(stage, FakeRS(meta=tc.Meta({"head_sha": HEAD}, provenance))),
             False,
         )
+
+# --- rebase ---------------------------------------------------------------------------------------
+# GitHub recomputes `mergeable` asynchronously, so a branch a peer just merged main into can still read
+# CONFLICTING on the live re-read. The compare API is what says whether there is anything left to do.
+gh = FakeGH()
+check("a conflicting rebase candidate still behind main is taken", still("rebase", FakeRS(), gh=gh), True)
+check("...having compared the head in its own repo", gh.compared, [("o", "r", HEAD, "main")])
+check(
+    "a rebase candidate that already contains main is declined even while it reads CONFLICTING",
+    still("rebase", FakeRS(), gh=FakeGH(behind=0)),
+    False,
+)
+check(
+    "a compare we could not make falls through to `mergeable`",
+    still("rebase", FakeRS(), gh=FakeGH(behind=None)),
+    True,
+)
+for label, gh in (
+    ("a head that moved since the survey", FakeGH(head="0" * 40)),
+    ("a PR closed since the survey", FakeGH(state="CLOSED")),
+    ("a PR we could not re-read at all", FakeGH(view=False)),
+):
+    check(f"{label} declines the rebase candidate", still("rebase", FakeRS(), gh=gh), False)
+    check("...without comparing", gh.compared, [])
+rs = FakeRS()
+still("rebase", rs)
+check("rebase never touches review state", (rs.forced, rs.busted), ([], []))
 
 # --- stages that do not read review state are not charged for a re-read ---------------------------
 for stage in ("fix-ci", "bump", "roadmap", "progress"):

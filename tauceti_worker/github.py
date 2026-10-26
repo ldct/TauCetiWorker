@@ -1100,6 +1100,16 @@ class GitHub:
         except Exception:
             pass
 
+    def behind_main(self, owner: str, repo: str, head: str, base: str = "main") -> int | None:
+        """How many `base` commits `head` (in its own repo, possibly a fork) is missing. 0 means the head
+        already contains the current base, so there is nothing for a rebase to bring in. None on any fetch
+        failure — callers must not read that as "up to date"."""
+        out = self.api_jq(f"/repos/{self.repo}/compare/{base}...{owner}:{repo}:{head}?per_page=1", ".behind_by")
+        try:
+            return int(out) if out else None
+        except ValueError:
+            return None
+
     def rebase_requested(self, pr: int, head: str) -> bool:
         """A trusted sweep handoff for this exact head; stale requests spend no attempts."""
         if not re.fullmatch(r"[0-9a-f]{40}", head):

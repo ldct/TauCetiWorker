@@ -846,8 +846,9 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
     Declining returns None from dispatch, which is the cascade's existing "offered but not taken, try
     the next candidate" path — the same one a peer's branch claim and progress's fresh re-check use.
 
-    Only the stages whose actionability comes from REVIEW state need this: rebase reads `mergeable`,
-    fix-ci and bump read the build, and roadmap/progress have no PR to re-read.
+    Only the stages whose actionability comes from REVIEW state need this, plus rebase, whose live
+    `mergeable` can lag a peer's push: fix-ci and bump read the build, and roadmap/progress have no PR
+    to re-read.
 
     Every read here is FORCED past the cache rather than arranged by busting it first. Busting and then
     reading normally looks equivalent and is not: the cache directory is shared with `status` and the
@@ -866,7 +867,19 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
         from .github_transport import read_context
 
         with read_context(fresh=True, direct=True):
-            live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels", "mergeable", "baseRefName"])
+            live = w.gh.pr_view(
+                c.pr,
+                [
+                    "headRefOid",
+                    "isDraft",
+                    "state",
+                    "labels",
+                    "mergeable",
+                    "baseRefName",
+                    "headRepositoryOwner",
+                    "headRepository",
+                ],
+            )
             if (
                 not live
                 or live.get("headRefOid") != c.head
@@ -877,6 +890,14 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool:
                 return False
             labels = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
             if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
+                return False
+            # GitHub recomputes `mergeable` asynchronously after a push, so a branch a peer has just
+            # merged main into can still read CONFLICTING here. Ask directly whether there is anything
+            # left to bring in; a failed compare is not evidence either way and falls through.
+            owner = (live.get("headRepositoryOwner") or {}).get("login") or ""
+            repo = (live.get("headRepository") or {}).get("name") or ""
+            if owner and repo and w.gh.behind_main(owner, repo, c.head, live["baseRefName"]) == 0:
+                log(f"  rebase #{c.pr}: head {c.head[:12]} already contains main (a peer just updated it?) — skipping")
                 return False
             return live.get("mergeable") == "CONFLICTING" or (
                 "needs-rebase" in labels and w.gh.rebase_requested(c.pr, c.head)
