@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -16,6 +17,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import provider_backoff
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -1349,6 +1351,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         if rc == 0:
             # Both changed and unchanged success prove the review is published.
             w.counters.write(errkey, 0)
+            provider_backoff.clear(reviewers)
             clear_review_failure(w.cfg.state, pr)
             # Notifications are also keyed to the authenticated GitHub account, so mute the PR's
             # thread only after the engine has confirmed its post. This is deliberately best-effort:
@@ -1394,6 +1397,17 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 f"so it is NOT charged to any PR's review-error budget. Check the reviewer credential "
                 f"and its remaining quota; the loop resumes on its own once it clears."
             )
+            # A rate limit outlives this process: every worker on the machine waits it out (escalating),
+            # rather than the next one-shot round launching straight back into it.
+            try:
+                tail = logf.read_text(errors="replace")[-20000:] if not bubble else ""
+            except OSError:
+                tail = ""
+            for limited in provider_backoff.rate_limited_providers(tail, [reviewers]):
+                secs = provider_backoff.record(limited)
+                warn_red(
+                    f"review #{pr}: {limited} is rate limiting this account — every worker here backs off {math.ceil(secs / 60)}m"
+                )
             raise NoProgress(f"review #{pr}: reviewer provider unavailable — machine-wide, not charged to the PR")
         else:
             if not runtime_snapshot().get("failure_reason"):

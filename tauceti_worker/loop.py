@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 
+from . import provider_backoff
 from .agents import resolve_authoring_profile
 from .budget import Budget, BudgetError, admission_pause
 from .claude_api import api_mode
@@ -568,6 +569,12 @@ def resolve_work_model(
         return agent, False
     if agent in OPENROUTER_MODELS or agent == "kiro":
         return agent, False
+    if agent in ("claude", "codex"):
+        # Availability, like a hard block: a provider answering 429 to every rubric is not paced past by
+        # --ignore-quota or $TAUCETI_SKIP_PACING, and launching into it only buys a clone and an abort.
+        held = provider_backoff.remaining(agent)
+        if held:
+            raise NoProgress(f"{provider_backoff.describe(agent, *held)}; not launching this round")
     if skip_pacing() and agent in ("claude", "codex"):
         # Operator opt-out: launch the pinned agent without reading usage at all. Nothing local paces
         # or guards the spend; the provider's own limits are the only stop.

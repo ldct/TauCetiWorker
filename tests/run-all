@@ -125,6 +125,7 @@ RUN_STDLIB=(
   scoped_repair_route.py
   rebase_budget.py
   review_no_archive.py
+  provider_backoff.py
   quota_claude_bootstrap.py
   quota_claude_windows.py
   quota_launch_stage.py
