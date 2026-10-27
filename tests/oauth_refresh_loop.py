@@ -251,6 +251,25 @@ with tempfile.TemporaryDirectory() as temporary:
         check(f"{type(failure).__name__} becomes a catchable OSError", caught.startswith("token endpoint unreachable:"))
         check(f"{type(failure).__name__} does not quote the request", "secret-token" not in caught)
 
+    # Cloudflare in front of the Claude token endpoint answers urllib's default "Python-urllib/3.x"
+    # User-Agent with 403 (error 1010), so the request must name its own.
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch.object(oauth.urllib.request, "urlopen", return_value=_Resp()) as opened:
+        oauth._post_json("https://example.test/claude", {"refresh_token": "t"})
+    ua = opened.call_args.args[0].get_header("User-agent") or ""
+    check("the token request sends an explicit, non-urllib User-Agent", bool(ua) and "Python-urllib" not in ua)
+
     # Valid JSON of the wrong SHAPE. Nothing here writes these files, so a hand edit or a schema change
     # must read as "nothing usable" — `.get()` on a list raises AttributeError, which the daemon does not
     # catch, so this used to kill the process whose whole job is to keep retrying.

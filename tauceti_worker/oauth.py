@@ -38,6 +38,7 @@ CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+USER_AGENT = "tauceti-worker"
 CODEX_REFRESH_PLACEHOLDER = "rt.0.tauceti-worker-placeholder-never-a-real-refresh-token"
 
 
@@ -272,7 +273,9 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int = 15) -> tuple[in
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        # An explicit User-Agent: Cloudflare in front of the Claude token endpoint rejects urllib's
+        # default "Python-urllib/3.x" with HTTP 403 (error 1010), so every renewal failed.
+        headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": USER_AGENT},
         method="POST",
     )
     # http.client raises its own exception tree for a truncated or malformed response (IncompleteRead,
