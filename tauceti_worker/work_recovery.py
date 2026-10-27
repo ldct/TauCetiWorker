@@ -43,6 +43,7 @@ import selectors
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import time
 from contextvars import ContextVar
@@ -1055,13 +1056,13 @@ def _set_status(record: Path, state: str, reason: str = "") -> bool:
 
 
 def live_users(repo: Path, *, session=None) -> list[str]:
-    """Processes whose cwd, root, or open files lie inside the checkout (Linux /proc; read-only).
-    Detached descendants without a live reference are outside this best-effort observation."""
+    """Processes whose cwd, root, or open files lie inside the checkout (Linux /proc, macOS lsof;
+    read-only). Detached descendants without a live reference are outside this best-effort observation."""
     proc = Path("/proc")
-    if not (proc / "self").exists():
-        return []
     target = os.path.realpath(repo)
     prefix = target.rstrip("/") + "/"
+    if not (proc / "self").exists():
+        return _darwin_users(target, prefix) if sys.platform == "darwin" else []
     skip = set()
     pid = os.getpid()
     while pid > 1:  # never report ourselves or the supervisors that started this round
@@ -1101,6 +1102,65 @@ def live_users(repo: Path, *, session=None) -> list[str]:
                     found.append(entry.name)
                 break
     return found
+
+
+def _darwin_users(target: str, prefix: str) -> list[str]:
+    """macOS has no /proc: one lsof pass over every process's cwd, root and open files. An
+    unreadable listing is reported as a user, so callers withhold the tree rather than delete it."""
+    _charge()
+    try:
+        table = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=30)
+        listing = subprocess.run(["lsof", "-nP", "-w", "-F", "pcn"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ["unknown (process listing unavailable)"]
+    if not listing.stdout.startswith("p"):
+        return ["unknown (lsof listing unavailable)"]
+    parents = {}
+    for line in table.stdout.splitlines():
+        with contextlib.suppress(ValueError):
+            pid, ppid = map(int, line.split())
+            parents[pid] = ppid
+    skip, pid = set(), os.getpid()
+    while pid > 1 and pid not in skip:  # never report ourselves or the supervisors that started this round
+        skip.add(pid)
+        pid = parents.get(pid, 0)
+    found, pid, command = [], None, ""
+    for line in listing.stdout.splitlines():
+        kind, value = line[:1], line[1:]
+        if kind == "p":
+            pid, command = int(value), ""
+        elif kind == "c":
+            command = value
+        elif kind == "n" and pid not in skip and (value == target or value.startswith(prefix)):
+            found.append(f"{pid} ({command})" if command else str(pid))
+            skip.add(pid)  # one entry per process, as on Linux
+    return found
+
+
+def mount_points() -> list[str]:
+    """Every visible mount point (bind mounts included). Raises OSError when this host's mount
+    table cannot be read: callers treat that as missing evidence and withhold the candidate."""
+    try:
+        raw = Path("/proc/self/mountinfo").read_text()
+    except FileNotFoundError:
+        if sys.platform != "darwin":
+            raise
+        return _darwin_mounts()
+    _charge(read=len(raw))
+    return [re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4]) for line in raw.splitlines()]
+
+
+def _darwin_mounts() -> list[str]:
+    try:
+        out = subprocess.run(["/sbin/mount"], capture_output=True, text=True, timeout=30, check=True).stdout
+    except subprocess.SubprocessError as error:
+        raise OSError(f"mount table unavailable: {error}") from error
+    _charge(read=len(out))
+    # "<device> on <mount point> (<fstype>, <options>)"; the mount point itself may contain " on ".
+    points = [line.split(" on ", 1)[1].rsplit(" (", 1)[0] for line in out.splitlines() if " on " in line]
+    if not points:
+        raise OSError("mount table is empty")
+    return points
 
 
 # Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks

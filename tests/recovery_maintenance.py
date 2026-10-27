@@ -640,7 +640,11 @@ print(json.dumps(dict(owner=process_owner(), child=child.pid)))
                 raise FileNotFoundError("fixture unsupported mount inspection")
             return real_read(path, *args, **kwargs)
 
-        with patch.object(Path, "read_text", unavailable):
+        # macOS has no mountinfo and falls back to mount(8); withhold that evidence too.
+        with (
+            patch.object(Path, "read_text", unavailable),
+            patch.object(wr, "_darwin_mounts", side_effect=OSError("fixture unsupported mount inspection")),
+        ):
             self.tick()
         self.assertTrue(tree.exists())
         self.tick()

@@ -12,7 +12,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
@@ -220,11 +219,8 @@ def _safe(state, tree, owner):
     # Protect visible mounts, including bind mounts on the same device. An unavailable
     # mount table withholds this candidate, without affecting work admission.
     try:
-        raw = Path("/proc/self/mountinfo").read_text()
-        wr._charge(read=len(raw))
         target = os.path.realpath(tree)
-        for line in raw.splitlines():
-            mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
+        for mount in wr.mount_points():
             if mount == target or mount.startswith(target + "/"):
                 return "await-mount-lease"
     except (OSError, IndexError):
@@ -1082,11 +1078,8 @@ def discard_record(state, record):
         # Same-device bind mounts need protection too; the bounded remover cannot
         # distinguish them from ordinary directories using inode/device alone.
         try:
-            mounts = Path("/proc/self/mountinfo").read_text()
-            wr._charge(read=len(mounts))
             target = str(record.resolve())
-            for line in mounts.splitlines():
-                mount = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), line.split()[4])
+            for mount in wr.mount_points():
                 if mount == target or mount.startswith(target + "/"):
                     return False
         except (OSError, IndexError):
