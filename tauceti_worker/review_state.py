@@ -16,11 +16,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotation only; survey is a higher layer
     from .survey import Counters
 
+from .blind_review import sighted_scoreboard
 from .config import Config
 from .constants import COMMENTS_MEMO_S, SBCACHE_BACKSTOP_S, SBCACHE_TTL
 from .github import GitHub
 from .github_transport import cache_hit, invalidate, read_context
-from .survey_facts import newest_contest, scoreboard
+from .survey_facts import newest_contest
+from .survey_facts import scoreboard as _newest_scoreboard
 
 # ============================================================================
 # ReviewState — the PR scoreboard comment is the multi-agent source of truth; a
@@ -46,8 +48,13 @@ class Meta:
     provenance: str
 
 
+def scoreboard(comments):
+    """The newest completed board's meta, with blind approvals skipped as the merge labeller does."""
+    return sighted_scoreboard(comments, _newest_scoreboard(comments))
+
+
 def _clean_head(meta: dict) -> str:
-    if meta.get("mode") == "init":
+    if meta.get("mode") == "init" or meta.get("blind_approval"):
         return ""
     states = meta.get("states") or {}
     if states:
